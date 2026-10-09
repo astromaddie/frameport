@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import posixpath
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from ..core.models import Recipe, data_manifest
 from ..frame.connection import Frame, sh_quote
 from ..patches import base
 from ..patches.settings import adapter_settings
+from . import obb
 
 
 @dataclass
@@ -41,6 +43,29 @@ def install_context(recipe: Recipe) -> base.InstallContext:
 
 def local_data_manifest(data_dir: Path | None, files: list[str] | None = None) -> dict[str, int]:
     return data_manifest(data_dir, files)
+
+
+def _plan_obb_owner_rewrites(plan: InstallPlan, manifest: dict[str, int]) -> tuple[dict, list[str]]:
+    """Adjust local manifest sizes for OBB owner rewrites, without touching any source files."""
+    if plan.apk_only or not plan.data_dir:
+        return {}, []
+    rewrites, without_footer = {}, []
+    for rel in manifest:
+        if Path(rel).suffix.lower() != ".obb":
+            continue
+        source = plan.data_dir / rel
+        try:
+            footer = obb.inspect_footer(source)
+            if footer is None:
+                without_footer.append(rel)
+                continue
+            rewrite = obb.plan_owner_rewrite(source, plan.package)
+        except obb.ObbFormatError as exc:
+            raise RuntimeError(f"can't safely correct OBB {rel}: {exc}") from exc
+        if rewrite is not None:
+            manifest[rel] = rewrite.output_size
+            rewrites[rel] = rewrite
+    return rewrites, without_footer
 
 
 class Speed:
@@ -74,8 +99,18 @@ def install(frame: Frame, plan: InstallPlan, reporter: Reporter) -> dict:
         raise RuntimeError("Lepton is not installed on the Frame (Setup → Install Lepton)")
     incoming = prep["incoming"]
     manifest = {} if plan.apk_only else local_data_manifest(plan.data_dir, plan.data_files)
+    rewrites, without_aosp_footer = _plan_obb_owner_rewrites(plan, manifest)
+    if plan.apk_only:
+        reporter.log("APK-only install: reusing expansion data already on the Frame; local OBB owner correction was "
+                     "skipped.")
+    if without_aosp_footer:
+        reporter.log(f"left {len(without_aosp_footer)} OBB file(s) without a recognized AOSP v1 footer unchanged")
+    if rewrites:
+        reporter.log(f"will correct the owner in {len(rewrites)} local OBB file(s) for {plan.package}; "
+                     "source files will remain unchanged")
     existing = prep["existing_obb"]
-    to_send = [rel for rel, size in manifest.items() if existing.get(rel) != size]
+    # Rewritten OBBs must be sent even when the new package name has the same byte length and the size is unchanged.
+    to_send = [rel for rel, size in manifest.items() if existing.get(rel) != size or rel in rewrites]
     need = sum(manifest[r] for r in to_send) + (0 if prep["same_apk"] else plan.apk.stat().st_size)
     if need > prep["free_bytes"] - (1 << 30):
         raise RuntimeError(f"not enough space on the Frame: need {need / 2**30:.1f} GiB + 1 GiB headroom, "
@@ -84,23 +119,39 @@ def install(frame: Frame, plan: InstallPlan, reporter: Reporter) -> dict:
     sent = 0
     speed = Speed(total)
 
-    with transfer_link(frame, reporter, need) as xfer:
-        reporter.stage("Upload APK")
-        if prep["same_apk"]:
-            reporter.log("identical APK already installed; not re-sending")
-        else:
-            def apk_cb(done, size):
-                reporter.check_cancel()
-                reporter.progress(done / total, f"APK {done / 2**20:.0f}/{size / 2**20:.0f} MiB",
-                                  speed=speed.text(done))
-            xfer.put(plan.apk, posixpath.join(incoming, "game.apk"), apk_cb)
-            sent += plan.apk.stat().st_size
-        if to_send:
-            reporter.stage(f"Upload data ({len(to_send)} files)")
-            upload_files(xfer, [(plan.data_dir / rel, f"obb/{rel}", manifest[rel]) for rel in to_send], incoming,
-                         reporter, total, sent, speed)
-        elif manifest:
-            reporter.log("game data already on the Frame; not re-sending")
+    with tempfile.TemporaryDirectory(prefix="frameport-obb-") if rewrites else contextlib.nullcontext() as stage:
+        staged_paths = {}
+        if rewrites:
+            stage_dir = Path(stage)
+            for index, rel in enumerate(to_send):
+                rewrite = rewrites.get(rel)
+                if rewrite is None:
+                    continue
+                staged = stage_dir / f"{index}.obb"
+                size = obb.write_owner_rewrite(plan.data_dir / rel, staged, rewrite)
+                if size != manifest[rel]:
+                    raise RuntimeError(f"staged OBB {rel} has size {size}, expected {manifest[rel]}")
+                staged_paths[rel] = staged
+
+        with transfer_link(frame, reporter, need) as xfer:
+            reporter.stage("Upload APK")
+            if prep["same_apk"]:
+                reporter.log("identical APK already installed; not re-sending")
+            else:
+                def apk_cb(done, size):
+                    reporter.check_cancel()
+                    reporter.progress(done / total, f"APK {done / 2**20:.0f}/{size / 2**20:.0f} MiB",
+                                      speed=speed.text(done))
+                xfer.put(plan.apk, posixpath.join(incoming, "game.apk"), apk_cb)
+                sent += plan.apk.stat().st_size
+            if to_send:
+                reporter.stage(f"Upload data ({len(to_send)} files)")
+                items = [(staged_paths.get(rel, plan.data_dir / rel), f"obb/{rel}", manifest[rel])
+                         for rel in to_send]
+                upload_files(xfer, items, incoming, reporter, total, sent, speed,
+                             restart={f"obb/{rel}" for rel in rewrites})
+            elif manifest:
+                reporter.log("game data already on the Frame; not re-sending")
 
     artwork.fetch(plan.package, plan.apk)
     upload_steam_art(frame, plan.package, prep["base"], reporter)
@@ -351,10 +402,11 @@ def transfer_link(frame: Frame, reporter: Reporter, need: int):
 
 
 def upload_files(frame: Frame, items: list[tuple[Path, str, int]], remote_root: str, reporter: Reporter,
-                 total: int, sent: int = 0, speed: Speed | None = None) -> int:
+                 total: int, sent: int = 0, speed: Speed | None = None, restart: set[str] | None = None) -> int:
     """Upload (local, relative path, size) items under remote_root. Interruptible (Cancel, dropped connection) and
     resumable: finished files are skipped next time (the agent counts files already in incoming/), a cut-off big file
-    continues from its .part. Returns bytes sent."""
+    continues from its .part unless its content was rewritten and may have the same size. Returns bytes sent."""
+    restart = restart or set()
     big = [i for i in items if i[2] >= BIG_FILE]
     small = [i for i in items if i[2] < BIG_FILE]
     frame.mkdirs(posixpath.dirname(posixpath.join(remote_root, rel)) for _, rel, _ in big)
@@ -369,7 +421,7 @@ def upload_files(frame: Frame, items: list[tuple[Path, str, int]], remote_root: 
         reporter.check_cancel()
         frame.put(local, posixpath.join(remote_root, rel),
                   lambda done, size, rel=rel: show(done, f"{rel} {done / 2**20:.0f}/{size / 2**20:.0f} MiB"),
-                  mkdir=False)
+                  resume=rel not in restart, mkdir=False)
         state["sent"] += size
     batch: list[tuple[Path, str]] = []
     batch_bytes = 0
