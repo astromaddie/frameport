@@ -549,8 +549,6 @@ def update_steam_art(frame: Frame, package: str, reporter: Reporter) -> dict:
 
 def add_to_steam(frame: Frame, packages: list[str], reporter: Reporter, wait: float = 120) -> dict:
     """Add library entries + artwork for installed games; Steam restarts once (a few seconds)."""
-    import time
-
     reporter.stage("Add to Steam library")
     frame.agent("shortcuts", packages=packages, restart=True)
     end = time.time() + wait
@@ -561,7 +559,7 @@ def add_to_steam(frame: Frame, packages: list[str], reporter: Reporter, wait: fl
             status = frame.agent("shortcut_status", timeout=30)
         except Exception:  # the SSH session can hiccup while Steam restarts
             continue
-        if status.get("state") in ("done", "failed"):
+        if status.get("state") in ("done", "failed", "partial", "deferred"):
             break
         if status.get("state") == "waiting":  # Steam restarts later: after the game, or back in Gaming Mode
             reporter.check("Steam library", None,
@@ -569,13 +567,35 @@ def add_to_steam(frame: Frame, packages: list[str], reporter: Reporter, wait: fl
                            if status.get("reason") == "desktop" else
                            "added when the game that's running now is closed (Steam has to restart for it)")
             return status
-    added = {a["package"] for a in status.get("added", [])}
+    added = {a["package"] for a in status.get("added", []) if a.get("package")}
     for a in status.get("added", []):
-        reporter.check(f"Steam library: {a['package']}", True, f"shortcut {a['appid']}")
+        route = "devkit entry" if a.get("via") == "devkit" else "shortcut"
+        appid = a.get("appid")
+        reporter.check(f"Steam library: {a['package']}", True,
+                       f"{route} {appid}" if appid is not None else f"{route} added")
+
+    deferred = set(status.get("deferred", []))
+    if status.get("state") == "deferred":
+        # Older workers may report only the state, not the package list. Missing entries are still pending, not failed.
+        deferred.update(pkg for pkg in packages if pkg not in added)
+    for pkg in packages:
+        if pkg in deferred and pkg not in added:
+            reporter.check(f"Steam library: {pkg}", None,
+                           "pending automatic retry when Steam's command pipe is ready")
+
+    failed_packages = set()
     for e in status.get("errors", []):
-        reporter.check("Steam library", False, e)
-    if not status.get("errors"):
-        for pkg in packages:
-            if pkg not in added:  # no answer in time: say so (Play adds a missing shortcut itself)
-                reporter.check(f"Steam library: {pkg}", False, "the Frame didn't confirm the library entry in time")
+        message = str(e)
+        pkg, separator, _detail = message.partition(":")
+        if separator and pkg in deferred:
+            continue  # this error explains the pending replay; don't call it a failure as well
+        if separator and pkg in packages:
+            failed_packages.add(pkg)
+            reporter.check(f"Steam library: {pkg}", False, message)
+        else:
+            reporter.check("Steam library", False, message)
+    for pkg in packages:
+        if pkg not in added and pkg not in deferred and pkg not in failed_packages:
+            # A missing result is not a successful library entry, even if another package also failed.
+            reporter.check(f"Steam library: {pkg}", False, "the Frame didn't confirm the library entry in time")
     return status

@@ -29,8 +29,10 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -38,7 +40,7 @@ import time
 import zlib
 from types import SimpleNamespace
 
-AGENT_VERSION = 64
+AGENT_VERSION = 66
 HOME = os.path.expanduser("~")
 STEAM = os.path.join(HOME, ".local/share/Steam")
 ANCHORS = os.path.join(HOME, "Applications/quest-frame")
@@ -48,6 +50,10 @@ PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
 
 class AgentError(Exception):
     pass
+
+
+class DevkitUnavailable(AgentError):
+    """Steam's devkit pipe isn't ready yet; the user timer will retry it."""
 
 
 def run(cmd, **kw):
@@ -1079,6 +1085,29 @@ def shortcuts_lost(users, packages, wait=25):
     return lost
 
 
+def normal_shortcut_exe(pkg):
+    return f'"{os.path.join(ANCHORS, check_pkg(pkg), "launch.sh")}"'
+
+
+def normal_shortcut_rows(pkg):
+    """Exact ordinary FramePort shortcut rows, by account, without touching unrelated Steam entries."""
+    exe = normal_shortcut_exe(pkg)
+    rows = []
+    for user in steam_users():
+        vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+        if not os.path.exists(vdf):
+            continue
+        try:
+            root = vdf_decode(open(vdf, "rb").read())
+        except (OSError, AgentError) as exc:
+            raise AgentError(f"Couldn't inspect {user}'s Steam shortcuts for {pkg}: {exc}") from None
+        for value in (root.get("shortcuts") or {}).values():
+            if isinstance(value, dict) and value.get("Exe") == exe:
+                appid = value.get("appid")
+                rows.append((user, appid & 0xFFFFFFFF if isinstance(appid, int) else None))
+    return rows
+
+
 def desktop_mode():
     """Desktop Mode is open: it runs inside Steam's session, so a Steam restart would end it (and FramePort itself when
     it runs on the Frame); library changes wait until the user is back in Gaming Mode."""
@@ -1159,9 +1188,33 @@ def _shortcuts_worker(payload):
                 for user in users:
                     update_library(user, lost, {"added": [], "errors": result["errors"]})
                 start_steam(service)
-                for pkg in shortcuts_lost(users, lost):
+                still_lost = shortcuts_lost(users, lost)
+                restored = []
+                deferred = []
+                partial = []
+                for pkg in still_lost:
                     result["added"] = [a for a in result["added"] if a["package"] != pkg]
-                    result["errors"].append(f"{pkg}: Steam removed the new library entry again after restarting")
+                    try:
+                        appid = devkit_register(pkg)
+                    except DevkitUnavailable as exc:
+                        deferred.append(pkg)
+                        result["errors"].append(f"{pkg}: Steam removed the ordinary entry; devkit fallback deferred: "
+                                                 f"{exc}")
+                    except AgentError as exc:
+                        partial.append(pkg)
+                        result["errors"].append(f"{pkg}: Steam removed the ordinary entry; devkit fallback failed: "
+                                                 f"{exc}")
+                    else:
+                        restored.append(pkg)
+                        result["added"].append({"package": pkg, "appid": appid, "via": "devkit"})
+                if restored:
+                    result["devkit_fallback"] = restored
+                if deferred:
+                    result["deferred"] = deferred
+                    result["state"] = "partial" if restored or partial else "deferred"
+                elif partial:
+                    result["partial"] = partial
+                    result["state"] = "partial"
     except Exception as exc:  # noqa: BLE001
         result["state"] = "failed"
         result["errors"].append(str(exc))
@@ -1468,6 +1521,241 @@ NOT_IN_LIBRARY = "not in the Frame's Steam library"
 # argv[0] relative to the game's folder: a link to the game's launch.sh. Steam names them "Devkit Game: <gameid>"
 # (no spaces allowed in the id), so they're only used where the normal entry fails.
 DEVKIT_GAMES = os.path.join(HOME, "devkit-game")
+DEVKIT_REGISTRY = os.path.join(HOME, ".local/share/frameport/devkit-owned.json")
+DEVKIT_LOCK = os.path.join(HOME, ".local/share/frameport/devkit.lock")
+DEVKIT_STATUS = os.path.join(HOME, ".local/share/frameport/devkit-reconcile-status.json")
+DEVKIT_SERVICE_DIR = os.path.join(HOME, ".local/share/frameport/devkit-reconcile")
+DEVKIT_AGENT_COPY = os.path.join(DEVKIT_SERVICE_DIR, "frameport_agent.py")
+DEVKIT_SYSTEMD_DIR = os.path.join(HOME, ".config/systemd/user")
+DEVKIT_SERVICE = os.path.join(DEVKIT_SYSTEMD_DIR, "frameport-devkit-reconcile.service")
+DEVKIT_TIMER = os.path.join(DEVKIT_SYSTEMD_DIR, "frameport-devkit-reconcile.timer")
+DEVKIT_GAMEID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def _devkit_lock():
+    """Serialize FramePort's registration, replay, and removal around Valve's non-idempotent create command."""
+    os.makedirs(os.path.dirname(DEVKIT_LOCK), exist_ok=True)
+    lock = open(DEVKIT_LOCK, "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def _devkit_registry():
+    try:
+        registry = json.load(open(DEVKIT_REGISTRY, encoding="utf-8"))
+    except FileNotFoundError:
+        return {"version": 1, "active": {}, "tombstones": {}}
+    except (OSError, ValueError) as exc:
+        raise AgentError(f"FramePort's devkit ownership file is unreadable: {exc}") from None
+    if not isinstance(registry, dict) or registry.get("version") != 1 or \
+            not isinstance(registry.get("active"), dict) or not isinstance(registry.get("tombstones"), dict):
+        raise AgentError("FramePort's devkit ownership file has an unsupported format; it was left unchanged")
+    for state in (registry["active"], registry["tombstones"]):
+        for pkg, item in state.items():
+            if not isinstance(pkg, str) or not PKG_RE.fullmatch(pkg) or not isinstance(item, dict) or \
+                    not DEVKIT_GAMEID_RE.fullmatch(str(item.get("gameid") or "")):
+                raise AgentError("FramePort's devkit ownership file has an invalid entry; it was left unchanged")
+            appid = item.get("appid")
+            if appid is not None and (type(appid) is not int or not 0 <= appid <= 0xFFFFFFFF):
+                raise AgentError("FramePort's devkit ownership file has an invalid app ID; it was left unchanged")
+            if "normal_cleanup_pending" in item and type(item["normal_cleanup_pending"]) is not bool:
+                raise AgentError("FramePort's devkit ownership file has an invalid route marker; it was left unchanged")
+    owned_ids = [item["gameid"] for state in (registry["active"], registry["tombstones"])
+                 for item in state.values()]
+    if set(registry["active"]) & set(registry["tombstones"]) or len(set(owned_ids)) != len(owned_ids):
+        raise AgentError("FramePort's devkit ownership file has overlapping IDs; it was left unchanged")
+    return registry
+
+
+def _save_devkit_registry(registry):
+    os.makedirs(os.path.dirname(DEVKIT_REGISTRY), exist_ok=True)
+    tmp = DEVKIT_REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(registry, f, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, DEVKIT_REGISTRY)
+
+
+def _mark_normal_cleanup_locked(pkg, registry):
+    """Remember an exact ordinary row only after Steam confirmed the devkit route is live."""
+    record = registry["active"].get(pkg)
+    if not record or not record.get("appid") or not normal_shortcut_rows(pkg):
+        return False
+    if not record.get("normal_cleanup_pending"):
+        record["normal_cleanup_pending"] = True
+        _save_devkit_registry(registry)
+    return True
+
+
+def _steam_is_fully_stopped():
+    if run(["pgrep", "-x", "steam"]).returncode == 0:
+        return False
+    # `pgrep` catches an unmanaged launch; checking the user unit avoids editing shortcuts.vdf while systemd is
+    # starting or stopping Steam between process checks.
+    return run(["systemctl", "--user", "is-active", "--quiet", "steam.service"]).returncode != 0
+
+
+def _cleanup_normal_routes_locked(registry, result):
+    """Finish already-confirmed route switches only while Steam is fully stopped; never restart it here."""
+    if not _steam_is_fully_stopped():
+        return
+    for pkg, record in list(registry["active"].items()):
+        if not record.get("normal_cleanup_pending"):
+            continue
+        if devkit_gameid(pkg) != record["gameid"]:
+            result["errors"].append(f"{pkg}: exact devkit launcher mapping changed; kept its ordinary row")
+            continue
+        before = len(result["errors"])
+        try:
+            rows = normal_shortcut_rows(pkg)
+            for user, appid in rows:
+                remove_from_library(user, [{"exe": normal_shortcut_exe(pkg), "appid": appid}], result)
+        except AgentError as exc:
+            result["errors"].append(f"{pkg}: ordinary shortcut cleanup pending: {exc}")
+        if len(result["errors"]) != before:
+            continue
+        record.pop("normal_cleanup_pending", None)
+        _save_devkit_registry(registry)
+        if rows:
+            result.setdefault("normal_removed", []).append(pkg)
+
+
+def _shortcuts_packages_in_flight():
+    """Packages whose ordinary library transaction still owns the shortcuts.vdf update window."""
+    status = cmd_shortcut_status({})
+    packages = status.get("packages") or []
+    try:
+        lock = open(STATUS_FILE + ".lock", "a")
+    except OSError:
+        lock = None
+    if lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return set(packages)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+    active = status.get("state") in ("running", "waiting")
+    age = time.time() - float(status.get("started") or 0)
+    return set(packages) if active and age < 120 else set()
+
+
+def _cleanup_normal_routes_when_idle(registry, result):
+    """Use the ordinary shortcuts transaction lock so its whole-file write can't race our exact-row cleanup."""
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    try:
+        lock = open(STATUS_FILE + ".lock", "a")
+    except OSError:
+        return
+    acquired = False
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            return
+        _cleanup_normal_routes_locked(registry, result)
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def _devkit_status(result):
+    os.makedirs(os.path.dirname(DEVKIT_STATUS), exist_ok=True)
+    tmp = DEVKIT_STATUS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(result, f, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, DEVKIT_STATUS)
+
+
+def _systemd_arg(value):
+    """Quote one systemd ExecStart/Environment argument (no shell is involved)."""
+    value = str(value)
+    if "\n" in value or "\r" in value:
+        raise AgentError("A path needed for the devkit service contains a newline")
+    return '"' + value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _install_devkit_service():
+    """Install a self-contained replay worker so a later GUI upload cannot replace the timer's code."""
+    os.makedirs(DEVKIT_SERVICE_DIR, exist_ok=True)
+    os.makedirs(DEVKIT_SYSTEMD_DIR, exist_ok=True)
+    source = os.path.abspath(__file__)
+    if os.path.realpath(source) != os.path.realpath(DEVKIT_AGENT_COPY):
+        tmp = DEVKIT_AGENT_COPY + ".tmp"
+        shutil.copyfile(source, tmp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, DEVKIT_AGENT_COPY)
+    service = "\n".join((
+        "[Unit]",
+        "Description=Replay FramePort-owned Steam devkit entries",
+        "After=default.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "TimeoutStartSec=8min",
+        f"Environment=HOME={_systemd_arg(HOME)}",
+        f"ExecStart={_systemd_arg(sys.executable)} {_systemd_arg(DEVKIT_AGENT_COPY)} _devkit_reconcile_worker",
+        "",
+    ))
+    timer = "\n".join((
+        "[Unit]",
+        "Description=Retry FramePort Steam devkit entries after login or Steam restart",
+        "",
+        "[Timer]",
+        "OnBootSec=1min",
+        "OnUnitActiveSec=1min",
+        "AccuracySec=30s",
+        "Unit=frameport-devkit-reconcile.service",
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    ))
+    for path, content in ((DEVKIT_SERVICE, service), (DEVKIT_TIMER, timer)):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    for cmd in (["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "enable", "--now", "frameport-devkit-reconcile.timer"]):
+        result = run(cmd)
+        if result.returncode != 0:
+            raise AgentError(f"Couldn't enable durable devkit replay ({' '.join(cmd)}): "
+                             f"{result.stderr.strip() or result.stdout.strip() or result.returncode}")
+    return {"service": DEVKIT_SERVICE, "timer": DEVKIT_TIMER, "agent_copy": DEVKIT_AGENT_COPY}
+
+
+def _remove_devkit_service():
+    """Remove the replay timer as part of FramePort's full purge, without touching Steam itself."""
+    wants = os.path.join(DEVKIT_SYSTEMD_DIR, "timers.target.wants", "frameport-devkit-reconcile.timer")
+    if not any(os.path.lexists(path) for path in (DEVKIT_SERVICE, DEVKIT_TIMER, wants)):
+        return
+    result = run(["systemctl", "--user", "disable", "--now", "frameport-devkit-reconcile.timer",
+                  "frameport-devkit-reconcile.service"])
+    if result.returncode not in (0, 1):
+        raise AgentError(f"Couldn't disable the devkit replay timer: {result.stderr.strip() or result.returncode}")
+    for path in (DEVKIT_SERVICE, DEVKIT_TIMER):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    reload_result = run(["systemctl", "--user", "daemon-reload"])
+    if reload_result.returncode != 0:
+        raise AgentError(f"Couldn't reload user systemd after removing the devkit timer: "
+                         f"{reload_result.stderr.strip() or reload_result.returncode}")
 
 
 def devkit_request(command, timeout=15):
@@ -1479,19 +1767,53 @@ def devkit_request(command, timeout=15):
     try:
         token = open(os.path.join(HOME, ".steam/steam.token")).read().strip()
     except OSError:
-        raise AgentError("Steam isn't running on the Frame (no session token)") from None
+        raise DevkitUnavailable("Steam's devkit session token isn't ready") from None
     with tempfile.TemporaryDirectory(prefix="frameport-devkit") as tmp:
         resp = os.path.join(tmp, "response")
         line = f"devkit-1 steam://devkit-1/{token}/{command.format(response=quote_plus(resp))}\n"
-        with open(os.path.realpath(os.path.join(HOME, ".steam/steam.pipe")), "wb", 0) as pipe:
-            pipe.write(line.encode())
-        for _ in range(timeout * 4):
-            time.sleep(0.25)
+        deadline = time.monotonic() + max(0, timeout)
+        try:
+            _write_devkit_pipe(os.path.join(HOME, ".steam/steam.pipe"), line.encode(), deadline)
+        except OSError:
+            raise DevkitUnavailable("Steam's devkit command pipe isn't ready") from None
+        while time.monotonic() < deadline:
             if os.path.exists(resp + ".error"):
                 raise AgentError(f"Steam: {open(resp + '.error', errors='replace').read().strip()}")
             if os.path.exists(resp) and not os.path.exists(resp + ".lock"):
                 return open(resp, errors="replace").read()
-    raise AgentError("Steam didn't answer the devkit request")
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    raise DevkitUnavailable("Steam didn't answer the devkit request yet")
+
+
+def _write_devkit_pipe(path, payload, deadline):
+    """Write to Steam's existing command FIFO without creating it or blocking on an absent reader."""
+    path = os.path.realpath(path)
+    try:
+        if not stat.S_ISFIFO(os.stat(path).st_mode):
+            raise DevkitUnavailable("Steam's devkit command path isn't a FIFO")
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        raise DevkitUnavailable("Steam's devkit command pipe isn't ready") from None
+    try:
+        pending = memoryview(payload)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DevkitUnavailable("Steam's devkit command pipe isn't accepting requests yet")
+            try:
+                _readable, writable, _exceptional = select.select([], [fd], [], remaining)
+                if not writable:
+                    raise DevkitUnavailable("Steam's devkit command pipe isn't accepting requests yet")
+                count = os.write(fd, pending)
+            except BlockingIOError:
+                continue
+            except OSError:
+                raise DevkitUnavailable("Steam's devkit command pipe isn't ready") from None
+            if count <= 0:
+                raise DevkitUnavailable("Steam's devkit command pipe closed before accepting the request")
+            pending = pending[count:]
+    finally:
+        os.close(fd)
 
 
 def devkit_gameid(pkg):
@@ -1543,47 +1865,308 @@ def devkit_appid_from_log(gameid):
     return found
 
 
-def devkit_register(pkg):
-    """Add the game to Steam through the devkit interface (Steam must run); copies its art. Returns the appid."""
-    dep = deployment(pkg) or {}
-    gameid = devkit_gameid(pkg)
-    if not gameid:
-        # Steam only accepts ids like identifiers: a letter first, then letters, digits and "_" (no spaces or "-")
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", dep.get("title") or "").strip("_")[:60] or pkg.replace(".", "_")
-        slug = re.sub(r"[^A-Za-z0-9_]", "_", slug)
-        if not slug[:1].isalpha():
-            slug = "Game_" + slug
-        gameid, n = slug, 2
-        while os.path.exists(os.path.join(DEVKIT_GAMES, gameid)):
-            gameid, n = f"{slug}_{n}", n + 1
+def devkit_list_gameids(timeout=15):
+    """Read Steam's live devkit IDs; local files alone do not prove Steam has an entry."""
+    raw = devkit_request("list-shortcuts?response={response}", timeout=timeout)
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise AgentError("Steam returned an invalid devkit shortcut list") from None
+    if not isinstance(value, dict) or value.get("version") != 2 or not isinstance(value.get("gameids"), list) or \
+            any(not isinstance(gid, str) for gid in value["gameids"]):
+        raise AgentError("Steam returned an unsupported devkit shortcut list")
+    return set(value["gameids"])
+
+
+def _devkit_new_gameid(pkg, dep, registry):
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", dep.get("title") or pkg).strip("_")[:60] or pkg.replace(".", "_")
+    slug = re.sub(r"[^A-Za-z0-9_]", "_", slug)
+    reserved = {item["gameid"] for item in registry["active"].values()}
+    reserved.update(item["gameid"] for item in registry["tombstones"].values())
+    prefix = "Game_" if not slug[:1].isalpha() else ""
+    base = slug[:64 - len(prefix)]
+    n = 1
+    while True:
+        suffix = "" if n == 1 else f"_{n}"
+        gameid = prefix + base[:64 - len(prefix) - len(suffix)] + suffix
+        if DEVKIT_GAMEID_RE.fullmatch(gameid) and gameid not in reserved and \
+                not os.path.exists(os.path.join(DEVKIT_GAMES, gameid)):
+            return gameid
+        n += 1
+
+
+def _devkit_folder_conflicts(pkg, gameid):
+    """Whether a recorded gameid's current launcher is no longer the package FramePort owns."""
+    link = os.path.join(DEVKIT_GAMES, gameid, "launch.sh")
+    if not os.path.lexists(link):
+        return False
+    target = os.path.join(ANCHORS, pkg, "launch.sh")
+    try:
+        return not os.path.islink(link) or os.readlink(link) != target
+    except OSError:
+        return True
+
+
+def _devkit_prepare_locked(pkg, registry):
+    """Persist a FramePort-owned ID before calling Steam, so a lost reply remains safely retryable."""
+    if pkg in registry["tombstones"]:
+        raise AgentError(f"{pkg} has a pending devkit removal; let Steam reconnect and retry first")
+    dep = deployment(pkg)
+    target = os.path.join(ANCHORS, pkg, "launch.sh")
+    if not dep or not os.path.isfile(target):
+        raise AgentError(f"{pkg} is not installed with a FramePort launcher")
+    linked = devkit_gameid(pkg)
+    record = registry["active"].get(pkg)
+    if record and linked and record["gameid"] != linked:
+        raise AgentError(f"{pkg} has a devkit ID that conflicts with FramePort's ownership record")
+    gameid = linked or (record or {}).get("gameid") or _devkit_new_gameid(pkg, dep, registry)
+    if not DEVKIT_GAMEID_RE.fullmatch(gameid):
+        raise AgentError(f"Invalid FramePort devkit ID for {pkg}")
     folder = os.path.join(DEVKIT_GAMES, gameid)
     os.makedirs(folder, exist_ok=True)
     link = os.path.join(folder, "launch.sh")
     if os.path.lexists(link):
-        os.remove(link)
-    os.symlink(os.path.join(ANCHORS, pkg, "launch.sh"), link)
-    with open(os.path.join(DEVKIT_GAMES, f"{gameid}-argv.json"), "w") as f:
-        json.dump(["launch.sh"], f)
-    with open(os.path.join(DEVKIT_GAMES, f"{gameid}-settings.json"), "w") as f:
-        json.dump({"steam_play": "0", "compat_tool": ""}, f)
-    from urllib.parse import quote_plus
+        if not os.path.islink(link) or os.readlink(link) != target:
+            raise AgentError(f"Devkit ID {gameid} is already owned by another launcher")
+    else:
+        os.symlink(target, link)
+    for suffix, value in (("argv", ["launch.sh"]),
+                          ("settings", {"steam_play": "0", "compat_tool": ""})):
+        path = os.path.join(DEVKIT_GAMES, f"{gameid}-{suffix}.json")
+        encoded = json.dumps(value)
+        try:
+            unchanged = open(path, encoding="utf-8").read() == encoded
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(encoded)
+    current = registry["active"].get(pkg)
+    updated = {"gameid": gameid, "appid": (record or {}).get("appid")}
+    if (record or {}).get("normal_cleanup_pending"):
+        updated["normal_cleanup_pending"] = True
+    if current != updated:
+        registry["active"][pkg] = updated
+        _save_devkit_registry(registry)
+    return gameid
 
+
+def _devkit_finish_tombstone_locked(pkg, tombstone, registry):
+    if _devkit_folder_conflicts(pkg, tombstone["gameid"]):
+        raise AgentError(f"{pkg}: devkit ID {tombstone['gameid']} now points to another launcher; cleanup was kept")
+    appid = tombstone.get("appid")
+    if appid:
+        for user in steam_users():
+            for art in grid_files(os.path.join(STEAM, "userdata", user, "config/grid"), appid):
+                os.remove(art)
+    _devkit_remove_files(tombstone["gameid"])
+    registry["tombstones"].pop(pkg, None)
+    _save_devkit_registry(registry)
+
+
+def _devkit_reconcile_locked(packages=None, readiness_timeout=15):
+    registry = _devkit_registry()
+    selected = set(packages) if packages is not None else set(registry["active"])
+    if not registry["active"] and not registry["tombstones"]:
+        return {"state": "done", "created": [], "present": [], "removed": [], "pending": [], "errors": []}
     try:
-        devkit_request("create-shortcut?response={response}&gameid=" + gameid + "&directory=" +
-                       quote_plus(DEVKIT_GAMES))
-    except AgentError:
-        _devkit_remove_files(gameid)
-        raise
-    appid = None
-    for _ in range(20):  # Steam writes the new entry to shortcuts.vdf right after answering
-        appid = devkit_appid(gameid)
-        if appid:
-            break
-        time.sleep(0.5)
-    if not appid:
-        raise AgentError("Steam added the devkit entry but didn't save it")
-    copy_grid_art(pkg, appid)
-    return appid
+        live = devkit_list_gameids(timeout=readiness_timeout)
+    except DevkitUnavailable as exc:
+        return {"state": "deferred", "reason": str(exc), "created": [], "present": [], "removed": [],
+                "pending": [], "errors": []}
+
+    result = {"state": "done", "created": [], "present": [], "removed": [], "pending": [], "errors": []}
+    # Deletions are restricted to exact IDs in FramePort's durable ownership record.
+    for pkg, tombstone in list(registry["tombstones"].items()):
+        gameid = tombstone["gameid"]
+        if _devkit_folder_conflicts(pkg, gameid):
+            result["errors"].append(f"{pkg}: devkit ID {gameid} now points to another launcher; removal was kept")
+            continue
+        if gameid in live:
+            try:
+                devkit_request("delete-shortcut?response={response}&gameid=" + gameid)
+                live.discard(gameid)
+                result["removed"].append(pkg)
+            except AgentError as exc:
+                result["errors"].append(f"{pkg}: removal pending: {exc}")
+                continue
+        try:
+            _devkit_finish_tombstone_locked(pkg, tombstone, registry)
+        except (AgentError, OSError) as exc:
+            result["errors"].append(f"{pkg}: local cleanup pending: {exc}")
+
+    for pkg in sorted(selected & set(registry["active"])):
+        record = registry["active"].get(pkg)
+        if not record:
+            continue
+        gameid = record["gameid"]
+        try:
+            if not deployment(pkg) or not os.path.isfile(os.path.join(ANCHORS, pkg, "launch.sh")):
+                if _devkit_folder_conflicts(pkg, gameid):
+                    result["errors"].append(f"{pkg}: devkit ID {gameid} now points to another launcher; "
+                                             "removal was kept")
+                    continue
+                registry["active"].pop(pkg, None)
+                registry["tombstones"][pkg] = record
+                _save_devkit_registry(registry)
+                if gameid in live:
+                    devkit_request("delete-shortcut?response={response}&gameid=" + gameid)
+                    live.discard(gameid)
+                    result["removed"].append(pkg)
+                try:
+                    _devkit_finish_tombstone_locked(pkg, record, registry)
+                except (AgentError, OSError) as exc:
+                    result["errors"].append(f"{pkg}: local cleanup pending: {exc}")
+                continue
+            _devkit_prepare_locked(pkg, registry)
+            needs_art = False
+            if gameid not in live:
+                from urllib.parse import quote_plus
+
+                devkit_request("create-shortcut?response={response}&gameid=" + gameid + "&directory=" +
+                               quote_plus(DEVKIT_GAMES))
+                live.add(gameid)
+                result["created"].append(pkg)
+                needs_art = True
+                appid = None
+                for _ in range(20):
+                    appid = devkit_appid(gameid)
+                    if appid:
+                        break
+                    time.sleep(0.5)
+                if not appid:
+                    result["pending"].append(pkg)
+                    continue
+            else:
+                result["present"].append(pkg)
+                appid = record.get("appid")
+                if not appid:
+                    appid = devkit_appid(gameid)
+                    needs_art = bool(appid)
+                if not appid:
+                    result["pending"].append(pkg)
+                    continue
+            if registry["active"][pkg].get("appid") != appid:
+                registry["active"][pkg]["appid"] = appid
+                _save_devkit_registry(registry)
+            if needs_art:
+                try:
+                    copy_grid_art(pkg, appid)
+                except OSError as exc:
+                    result["errors"].append(f"{pkg}: artwork: {exc}")
+        except AgentError as exc:
+            result["errors"].append(f"{pkg}: {exc}")
+    if result["errors"] or result["pending"]:
+        result["state"] = "partial"
+    return result
+
+
+def devkit_register(pkg):
+    """Durably register an app for replay, then add it through Steam without restarting Steam."""
+    pkg = check_pkg(pkg)
+    _install_devkit_service()
+    lock = _devkit_lock()
+    try:
+        registry = _devkit_registry()
+        gameid = _devkit_prepare_locked(pkg, registry)
+        result = _devkit_reconcile_locked([pkg])
+        _devkit_status(result)
+        if result["state"] == "deferred":
+            raise DevkitUnavailable(result["reason"])
+        if result["errors"]:
+            raise AgentError(result["errors"][0])
+        appid = registry["active"].get(pkg, {}).get("appid") or devkit_appid(gameid)
+        if not appid:
+            raise AgentError("Steam added the devkit entry but its app ID is not available yet")
+        registry = _devkit_registry()
+        _mark_normal_cleanup_locked(pkg, registry)
+        return appid
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def cmd_reconcile_devkit(args):
+    """Register selected installed games, or all installed games when packages is omitted; launches nothing."""
+    requested = args.get("packages")
+    if requested is None:
+        requested = [item["package"] for item in cmd_list_installed({})["games"]]
+    if not isinstance(requested, list):
+        raise AgentError("packages must be a list of installed package names")
+    packages = list(dict.fromkeys(check_pkg(pkg) for pkg in requested))
+    for pkg in packages:
+        if not deployment(pkg) or not os.path.isfile(os.path.join(ANCHORS, pkg, "launch.sh")):
+            raise AgentError(f"{pkg} is not installed with a FramePort launcher")
+    service = _install_devkit_service() if packages else None
+    lock = _devkit_lock()
+    try:
+        registry = _devkit_registry()
+        for pkg in packages:
+            _devkit_prepare_locked(pkg, registry)
+        result = _devkit_reconcile_locked(packages)
+        confirmed = set(result.get("created", [])) | set(result.get("present", []))
+        registry = _devkit_registry()
+        for pkg in confirmed:
+            _mark_normal_cleanup_locked(pkg, registry)
+        if service:
+            result["service"] = service
+        _devkit_status(result)
+        return result
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def _devkit_discover_legacy_locked(registry):
+    """Adopt older FramePort installs only when no account has their exact ordinary launcher row."""
+    if not steam_users():
+        return [], []
+    in_flight = _shortcuts_packages_in_flight()
+    adopted, errors = [], []
+    try:
+        games = cmd_list_installed({})["games"]
+    except AgentError as exc:
+        return [], [f"Couldn't inspect installed FramePort games: {exc}"]
+    for item in games:
+        pkg = item.get("package")
+        if not pkg or pkg in registry["active"] or pkg in registry["tombstones"] or pkg in in_flight or \
+                item.get("drive_missing"):
+            continue
+        try:
+            if normal_shortcut_rows(pkg):
+                continue  # valid ordinary entries keep their current route
+            _devkit_prepare_locked(pkg, registry)
+            adopted.append(pkg)
+        except AgentError as exc:
+            errors.append(f"{pkg}: adoption deferred: {exc}")
+    return adopted, errors
+
+
+def _devkit_reconcile_worker():
+    lock = _devkit_lock()
+    try:
+        registry = _devkit_registry()
+        cleanup = {"state": "done", "created": [], "present": [], "removed": [], "pending": [], "errors": []}
+        _cleanup_normal_routes_when_idle(registry, cleanup)
+        adopted, adoption_errors = _devkit_discover_legacy_locked(registry)
+        result = _devkit_reconcile_locked(readiness_timeout=3)
+        if adopted:
+            result["adopted"] = adopted
+        result["errors"] = cleanup["errors"] + result["errors"] + adoption_errors
+        if cleanup.get("normal_removed"):
+            result["normal_removed"] = cleanup["normal_removed"]
+        if cleanup["errors"] or adoption_errors or result.get("pending"):
+            if result["state"] != "deferred":
+                result["state"] = "partial"
+        confirmed = set(result.get("created", [])) | set(result.get("present", []))
+        registry = _devkit_registry()
+        for pkg in confirmed:
+            _mark_normal_cleanup_locked(pkg, registry)
+        _devkit_status(result)
+        return result
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def copy_grid_art(pkg, appid, users=None):
@@ -1602,27 +2185,40 @@ def copy_grid_art(pkg, appid, users=None):
 
 
 def devkit_unregister(pkg, steam_running=True):
-    """Remove the game's devkit entry: Steam's entry (live when Steam runs; else from shortcuts.vdf), its art and
-    the ~/devkit-game files. Returns whether there was one."""
-    gameid = devkit_gameid(pkg)
-    if not gameid:
-        return False
-    appid = devkit_appid(gameid)
-    exe = f'"{os.path.join(DEVKIT_GAMES, gameid, "launch.sh")}"'
-    if steam_running:
-        try:
-            devkit_request("delete-shortcut?response={response}&gameid=" + gameid)
-        except AgentError:
-            pass
-    else:
-        for user in steam_users():
-            remove_shortcut(os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf"), exe)
-    if appid:
-        for user in steam_users():
-            for art in grid_files(os.path.join(STEAM, "userdata", user, "config/grid"), appid):
-                os.remove(art)
-    _devkit_remove_files(gameid)
-    return True
+    """Remove one exact FramePort-owned devkit ID; leave a durable tombstone if Steam cannot remove it live."""
+    pkg = check_pkg(pkg)
+    lock = _devkit_lock()
+    try:
+        registry = _devkit_registry()
+        record = registry["active"].get(pkg) or registry["tombstones"].get(pkg)
+        gameid = devkit_gameid(pkg) or (record or {}).get("gameid")
+        if not gameid:
+            return False
+        if not DEVKIT_GAMEID_RE.fullmatch(gameid):
+            raise AgentError(f"Invalid FramePort devkit ID for {pkg}; no Steam changes were made")
+        if _devkit_folder_conflicts(pkg, gameid):
+            raise AgentError(f"{pkg}: devkit ID {gameid} now points to another launcher; no Steam changes were made")
+        appid = devkit_appid(gameid) or (record or {}).get("appid")
+        registry["active"].pop(pkg, None)
+        registry["tombstones"][pkg] = {"gameid": gameid, "appid": appid}
+        _save_devkit_registry(registry)
+        if steam_running:
+            # Install the retry path before asking Steam; if the request fails the uninstall can still remove the
+            # game anchor while this exact gameid remains available for later cleanup.
+            _install_devkit_service()
+            live = devkit_list_gameids()
+            if gameid in live:
+                devkit_request("delete-shortcut?response={response}&gameid=" + gameid)
+            _devkit_finish_tombstone_locked(pkg, registry["tombstones"][pkg], registry)
+        else:
+            exe = f'"{os.path.join(DEVKIT_GAMES, gameid, "launch.sh")}"'
+            for user in steam_users():
+                remove_shortcut(os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf"), exe)
+            _devkit_finish_tombstone_locked(pkg, registry["tombstones"][pkg], registry)
+        return True
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def _devkit_remove_files(gameid):
@@ -1644,19 +2240,35 @@ def cmd_launch(args):
         check_base_present(dep["base"], dep.get("title") or pkg)
     if run(["pgrep", "-x", "steam"]).returncode != 0:
         raise AgentError("Steam isn't running on the Frame")
+    fallback = args.get("fallback", True)
     devkit = devkit_gameid(pkg)
     appid = devkit_appid(devkit) if devkit else None  # this Frame needed the fallback entry before: use it
-    if devkit and not appid:
+    devkit_attempted = False
+    devkit_error = None
+    if devkit and not appid and fallback:
         # Steam forgot the devkit entry (it never saves it on some Frames, and a restart drops it, GitHub #41): add it
         # again live instead of reporting NOT_IN_LIBRARY, whose repair restarts Steam
+        devkit_attempted = True
         try:
             appid = devkit_register(pkg)
-        except AgentError:
+        except AgentError as exc:
+            devkit_error = str(exc)
             appid = None
     via = "devkit" if appid else "shortcut"
     appid = appid or shortcut_appid_for(f'"{os.path.join(ANCHORS, pkg)}/launch.sh"')
     if appid is None:  # Steam would only say "Game configuration unavailable"
-        raise AgentError(f"{NOT_IN_LIBRARY}: {dep.get('title') or pkg}")
+        if fallback and not devkit_attempted:
+            devkit_attempted = True
+            try:
+                appid = devkit_register(pkg)
+            except AgentError as exc:
+                raise AgentError(f"{NOT_IN_LIBRARY}: {dep.get('title') or pkg} (devkit fallback: {exc})") from None
+            via = "devkit"
+        elif fallback:
+            reason = devkit_error or "Steam didn't provide a devkit app ID"
+            raise AgentError(f"{NOT_IN_LIBRARY}: {dep.get('title') or pkg} (devkit fallback: {reason})")
+        else:
+            raise AgentError(f"{NOT_IN_LIBRARY}: {dep.get('title') or pkg}")
     steam = steam_launch(appid, args.get("wait", 10))
     out = {"package": pkg, "gameid": steam_gameid(appid), "title": dep.get("title"), "via": via, "steam": steam}
     if steam["result"] == "error" and steam.get("code") == 9 and args.get("fallback", True):
@@ -4346,6 +4958,7 @@ def purge_worker(payload):
     result = {"state": "done", "removed": [], "kept": [], "errors": []}
     service = True
     try:
+        _remove_devkit_service()
         games = cmd_list_installed({})["games"]
         users = steam_users()
         try:
@@ -5494,6 +6107,14 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "_shortcuts_worker":
         shortcuts_worker(sys.argv[2])
         return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "_devkit_reconcile_worker":
+        try:
+            _devkit_reconcile_worker()
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            _devkit_status({"state": "failed", "errors": [f"{type(exc).__name__}: {exc}"]})
+            print(f"devkit reconcile: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     if len(sys.argv) >= 3 and sys.argv[1] == "_purge_worker":
         purge_worker(sys.argv[2])
         return 0

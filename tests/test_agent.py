@@ -408,6 +408,40 @@ def test_launch_uses_steam_shortcut(monkeypatch, tmp_path):
     assert calls[-1][-1] == f"steam://rungameid/{r['gameid']}" and calls[-1][0] == "systemd-run"
 
 
+def test_launch_without_shortcut_registers_devkit_by_default_but_opt_out_is_strict(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.y"
+    anchor.mkdir(parents=True)
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.y", "appid": 1, "title": "X",
+                                                        "base": str(anchor)}))
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(a, "devkit_gameid", lambda pkg: None)
+    monkeypatch.setattr(a, "devkit_appid", lambda gid: None)
+    monkeypatch.setattr(a, "shortcut_appid_for", lambda exe: None)
+    registrations, launches = [], []
+    monkeypatch.setattr(a, "devkit_register", lambda pkg: registrations.append(pkg) or 222)
+    monkeypatch.setattr(a, "steam_launch", lambda appid, wait=10: launches.append(appid) or
+                        {"result": "started", "appid": appid})
+
+    result = a.cmd_launch({"package": "com.x.y"})
+    assert registrations == ["com.x.y"] and launches == [222]
+    assert result["via"] == "devkit" and result["steam"]["appid"] == 222
+
+    registrations.clear()
+    launches.clear()
+    with pytest.raises(a.AgentError, match="not in the Frame's Steam library"):
+        a.cmd_launch({"package": "com.x.y", "fallback": False})
+    assert not registrations and not launches
+
+    monkeypatch.setattr(a, "devkit_gameid", lambda pkg: "Existing")
+    monkeypatch.setattr(a, "devkit_appid", lambda gid: None)
+    monkeypatch.setattr(a, "devkit_register", lambda pkg: registrations.append(pkg) or
+                        (_ for _ in ()).throw(a.DevkitUnavailable("pipe unavailable")))
+    with pytest.raises(a.AgentError, match="devkit fallback: pipe unavailable"):
+        a.cmd_launch({"package": "com.x.y"})
+    assert registrations == ["com.x.y"] and not launches
+
+
 def test_library_users_prefers_the_signed_in_account(monkeypatch, tmp_path):
     a = load_agent(monkeypatch, tmp_path)
     steam = tmp_path / ".local/share/Steam"
@@ -696,6 +730,41 @@ def test_uninstall_removes_the_shortcut_with_steam_closed(monkeypatch, tmp_path)
     assert r["shortcut_removed"] and started and started[0][0] == "systemd-run"  # the detached worker, not a live edit
     payload = json.loads(started[0][-1])
     assert payload["remove"] == [{"exe": f'"{anchor}/launch.sh"', "appid": 7}]
+
+
+def test_timer_switch_removes_only_the_confirmed_devkit_packages_normal_row(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    rows = {}
+    for pkg, title in (("com.x.route", "Route"), ("com.x.keep", "Keep")):
+        anchor = tmp_path / "Applications/quest-frame" / pkg
+        anchor.mkdir(parents=True)
+        (anchor / "launch.sh").write_text("#!/bin/sh\n")
+        (anchor / "deployment.json").write_text(json.dumps({"package": pkg, "appid": 1, "title": title,
+                                                              "base": str(anchor)}))
+        rows[pkg] = a.normal_shortcut_exe(pkg)
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    a.upsert_shortcut(str(vdf), rows["com.x.route"], "Old ordinary route", str(tmp_path), "")
+    a.upsert_shortcut(str(vdf), rows["com.x.keep"], "Keep ordinary route", str(tmp_path), "")
+    external = '"/home/steamos/devkit-game/External/launch.sh"'
+    a.upsert_shortcut(str(vdf), external, "External", "/home/steamos")
+    root = a.vdf_decode(vdf.read_bytes())
+    root["shortcuts"]["2"].update(appid=333, Devkit=1, DevkitGameID="External")
+    vdf.write_bytes(a.vdf_encode(root))
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+    # The route changes only after Valve confirms the package's owned devkit entry is live.
+    assert a.devkit_register("com.x.route") == 2772269798
+    registry = json.loads(Path(a.DEVKIT_REGISTRY).read_text())
+    assert registry["active"]["com.x.route"]["normal_cleanup_pending"] is True
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    replay = a._devkit_reconcile_worker()  # production timer path, with Steam stopped
+
+    exes = {value["Exe"] for value in a.vdf_decode(vdf.read_bytes())["shortcuts"].values()}
+    assert rows["com.x.route"] not in exes and rows["com.x.keep"] in exes and external in exes
+    assert replay["normal_removed"] == ["com.x.route"]
+    assert "External" in a.devkit_list_gameids() and not any("delete-shortcut" in line for line in sent)
+    assert "normal_cleanup_pending" not in json.loads(Path(a.DEVKIT_REGISTRY).read_text())[
+        "active"]["com.x.route"]
 
 
 def test_prune_also_matches_the_earlier_tag_name(monkeypatch, tmp_path):
@@ -1016,54 +1085,85 @@ def test_steam_launch_result_app_error(monkeypatch, tmp_path):
     assert a.steam_launch_result(str(log), 0, 35540780, wait=0)["result"] == "silent"  # no prefix matches
 
 
-def _fake_steam(a, monkeypatch, tmp_path, appid=2772269798):
+def _fake_steam(a, tmp_path, request, appid=2772269798):
     """Steam's devkit side: answers create/delete requests and writes/removes the shortcut like Steam does."""
+    import select
+    import threading
+
     sent = []
     vdf = tmp_path / ".local/share/Steam/userdata/42/config/shortcuts.vdf"
     vdf.parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / ".steam").mkdir(exist_ok=True)
     (tmp_path / ".steam/steam.token").write_text("tok")
     pipe = tmp_path / ".steam/steam.pipe"
-    pipe.write_text("")
+    os.mkfifo(pipe)
+    stopped = threading.Event()
+    fd = os.open(pipe, os.O_RDWR | os.O_NONBLOCK)
 
-    real_open = open
+    def respond(line):
+        sent.append(line)
+        from urllib.parse import parse_qs, urlparse
 
-    def fake_open(path, mode="r", *args, **kw):
-        if str(path) == str(pipe) and "w" in mode:
-            class P:
-                def write(self, data):
-                    line = data.decode().strip()
-                    sent.append(line)
-                    from urllib.parse import parse_qs, urlparse
-                    url = urlparse(line.split(" ", 1)[1])
-                    q = parse_qs(url.query)
-                    cmd = url.path.rsplit("/", 1)[-1]
-                    if cmd == "create-shortcut":
-                        gid = q["gameid"][0]
-                        a.upsert_shortcut(str(vdf), f'"{a.DEVKIT_GAMES}/{gid}/launch.sh"', f"Devkit Game: {gid}",
-                                          f"{a.DEVKIT_GAMES}/{gid}", "")
-                        root = a.vdf_decode(vdf.read_bytes())
-                        for v in root["shortcuts"].values():
-                            if v["Exe"].endswith(f'/{gid}/launch.sh"'):
-                                v.update(appid=appid, Devkit=1, DevkitGameID=gid)
-                        vdf.write_bytes(a.vdf_encode(root))
-                    elif cmd == "delete-shortcut":
-                        a.remove_shortcut(str(vdf), f'"{a.DEVKIT_GAMES}/{q["gameid"][0]}/launch.sh"')
-                    real_open(q["response"][0], "w").write("ok")
+        def publish(path, content):
+            tmp = Path(path + ".tmp")
+            tmp.write_text(content)
+            os.replace(tmp, path)
 
-                def __enter__(self):
-                    return self
+        url = urlparse(line.split(" ", 1)[1])
+        q = parse_qs(url.query)
+        cmd = url.path.rsplit("/", 1)[-1]
+        if cmd == "list-shortcuts":
+            root = a.vdf_decode(vdf.read_bytes()) if vdf.exists() else {"shortcuts": {}}
+            ids = sorted(v["DevkitGameID"] for v in root.get("shortcuts", {}).values()
+                         if isinstance(v, dict) and v.get("DevkitGameID"))
+            publish(q["response"][0], json.dumps({"version": 2, "gameids": ids}))
+        elif cmd == "create-shortcut":
+            gid = q["gameid"][0]
+            a.upsert_shortcut(str(vdf), f'"{a.DEVKIT_GAMES}/{gid}/launch.sh"', f"Devkit Game: {gid}",
+                              f"{a.DEVKIT_GAMES}/{gid}", "")
+            root = a.vdf_decode(vdf.read_bytes())
+            for value in root["shortcuts"].values():
+                if value["Exe"].endswith(f'/{gid}/launch.sh"'):
+                    value.update(appid=appid, Devkit=1, DevkitGameID=gid)
+            vdf.write_bytes(a.vdf_encode(root))
+            publish(q["response"][0], "ok")
+        elif cmd == "delete-shortcut":
+            a.remove_shortcut(str(vdf), f'"{a.DEVKIT_GAMES}/{q["gameid"][0]}/launch.sh"')
+            publish(q["response"][0], "ok")
+        else:
+            publish(q["response"][0] + ".error", f"unknown fake command: {cmd}")
 
-                def __exit__(self, *e):
-                    return False
-            return P()
-        return real_open(path, mode, *args, **kw)
-    monkeypatch.setattr(a, "open", fake_open, raising=False)
-    monkeypatch.setattr("builtins.open", fake_open)
+    def serve():
+        buffered = b""
+        while not stopped.is_set():
+            readable, _w, _x = select.select([fd], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                continue
+            buffered += chunk
+            while b"\n" in buffered:
+                raw, buffered = buffered.split(b"\n", 1)
+                if raw:
+                    respond(raw.decode())
+
+    thread = threading.Thread(target=serve, name="fake-steam-devkit", daemon=True)
+    thread.start()
+
+    def stop():
+        stopped.set()
+        thread.join(timeout=1)
+        os.close(fd)
+
+    request.addfinalizer(stop)
     return sent, vdf
 
 
-def test_devkit_fallback_register_and_unregister(monkeypatch, tmp_path):
+def test_devkit_fallback_register_and_unregister(monkeypatch, tmp_path, request):
     a = load_agent(monkeypatch, tmp_path)
     anchor = tmp_path / "Applications/quest-frame/com.camouflaj.manta"
     (anchor / "artwork").mkdir(parents=True)
@@ -1071,17 +1171,21 @@ def test_devkit_fallback_register_and_unregister(monkeypatch, tmp_path):
     (anchor / "artwork/portrait.jpg").write_bytes(b"jpg")
     (anchor / "deployment.json").write_text(json.dumps({"package": "com.camouflaj.manta", "appid": 3554078061,
                                                         "title": "Batman: Arkham Shadow", "base": str(anchor)}))
-    sent, vdf = _fake_steam(a, monkeypatch, tmp_path)
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(a.time, "sleep", lambda s: None)
     appid = a.devkit_register("com.camouflaj.manta")
     assert appid == 2772269798 and a.devkit_gameid("com.camouflaj.manta") == "Batman_Arkham_Shadow"
-    assert "create-shortcut" in sent[0] and "gameid=Batman_Arkham_Shadow" in sent[0]  # no spaces in the id
+    assert any("create-shortcut" in line and "gameid=Batman_Arkham_Shadow" in line for line in sent)
+    assert "list-shortcuts" in sent[0]  # query first so the replay cannot duplicate an existing entry
     dk = tmp_path / "devkit-game"
     assert json.loads((dk / "Batman_Arkham_Shadow-argv.json").read_text()) == ["launch.sh"]
     assert os.readlink(dk / "Batman_Arkham_Shadow/launch.sh") == str(anchor / "launch.sh")
     grid = vdf.parent / "grid"
     assert (grid / "2772269798p.jpg").exists()  # its art under Steam's new appid
+    before = len([line for line in sent if "create-shortcut" in line])
     assert a.devkit_register("com.camouflaj.manta") == appid  # registering again reuses the same id
+    assert len([line for line in sent if "create-shortcut" in line]) == before
     assert a.devkit_unregister("com.camouflaj.manta")
     assert not (dk / "Batman_Arkham_Shadow").exists() and not list(grid.iterdir())
     assert a.devkit_appid("Batman_Arkham_Shadow") is None and not a.devkit_unregister("com.camouflaj.manta")
@@ -1090,6 +1194,324 @@ def test_devkit_fallback_register_and_unregister(monkeypatch, tmp_path):
     (anchor / "deployment.json").write_text(json.dumps({**dep, "title": "4XVR Video-Player"}))
     a.devkit_register("com.camouflaj.manta")
     assert a.devkit_gameid("com.camouflaj.manta") == "Game_4XVR_Video_Player"
+
+    dep = json.loads((anchor / "deployment.json").read_text())
+    dep["title"] = "9" + "LongTitle" * 20
+    registry = {"version": 1, "active": {}, "tombstones": {}}
+    gameid = a._devkit_new_gameid("com.camouflaj.manta", dep, registry)
+    assert len(gameid) <= 64 and a.DEVKIT_GAMEID_RE.fullmatch(gameid)
+    os.makedirs(a.DEVKIT_GAMES, exist_ok=True)
+    Path(a.DEVKIT_GAMES, gameid).mkdir()
+    collision = a._devkit_new_gameid("com.camouflaj.manta", dep, registry)
+    assert len(collision) <= 64 and a.DEVKIT_GAMEID_RE.fullmatch(collision) and collision != gameid
+
+
+def test_devkit_cleanup_refuses_recorded_id_repointed_to_another_launcher(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.y"
+    anchor.mkdir(parents=True)
+    (anchor / "launch.sh").write_text("#!/bin/sh\n")
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.y", "appid": 1, "title": "X",
+                                                        "base": str(anchor)}))
+    sent, _vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert a.devkit_register("com.x.y") == 2772269798
+    gameid = a.devkit_gameid("com.x.y")
+    link = Path(a.DEVKIT_GAMES, gameid, "launch.sh")
+    link.unlink()
+    link.symlink_to("/home/steamos/devkit-game/Unrelated/launch.sh")
+
+    (anchor / "deployment.json").unlink()
+    active_retry = a._devkit_reconcile_worker()
+    assert active_retry["state"] == "partial" and any("points to another launcher" in e
+                                                        for e in active_retry["errors"])
+    assert a._devkit_registry()["active"]["com.x.y"]["gameid"] == gameid
+    assert not any("delete-shortcut" in line for line in sent)
+
+    with pytest.raises(a.AgentError, match="points to another launcher"):
+        a.devkit_unregister("com.x.y")
+    assert not any("delete-shortcut" in line for line in sent)
+    registry = a._devkit_registry()
+    record = registry["active"].pop("com.x.y")
+    registry["tombstones"]["com.x.y"] = record
+    a._save_devkit_registry(registry)
+    replay = a._devkit_reconcile_worker()
+    assert replay["state"] == "partial" and any("points to another launcher" in e for e in replay["errors"])
+    assert a._devkit_registry()["tombstones"]["com.x.y"]["gameid"] == gameid
+    assert link.is_symlink() and os.readlink(link) == "/home/steamos/devkit-game/Unrelated/launch.sh"
+    assert not any("delete-shortcut" in line for line in sent)
+
+
+def test_devkit_reconcile_replays_owned_ids_and_preserves_unrelated_entries(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    for pkg, title in (("com.x.alpha", "Alpha"), ("com.x.beta", "Beta")):
+        anchor = tmp_path / "Applications/quest-frame" / pkg
+        anchor.mkdir(parents=True)
+        (anchor / "launch.sh").write_text("#!/bin/sh\n")
+        (anchor / "deployment.json").write_text(json.dumps({"package": pkg, "appid": 1, "title": title,
+                                                              "base": str(anchor)}))
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(a, "steam_launch", lambda *args, **kwargs: pytest.fail("reconciliation must not launch apps"))
+    # A pre-existing devkit entry is not FramePort-owned and must survive both replay and selected-package runs.
+    a.upsert_shortcut(str(vdf), '"/external/KeepMe/launch.sh"', "External", "/external", "")
+    root = a.vdf_decode(vdf.read_bytes())
+    root["shortcuts"]["0"].update(Devkit=1, DevkitGameID="External-Tool")
+    vdf.write_bytes(a.vdf_encode(root))
+
+    first = a.cmd_reconcile_devkit({})
+    assert first["state"] == "done" and sorted(first["created"]) == ["com.x.alpha", "com.x.beta"]
+    assert "External-Tool" in a.devkit_list_gameids()
+    create_count = lambda: len([line for line in sent if "create-shortcut" in line])
+    assert create_count() == 2
+
+    selected = a.cmd_reconcile_devkit({"packages": ["com.x.alpha"]})
+    assert selected["present"] == ["com.x.alpha"] and create_count() == 2
+
+    # Steam restart forgot FramePort's live IDs but retained an unrelated developer entry.
+    root = a.vdf_decode(vdf.read_bytes())
+    root["shortcuts"] = {key: value for key, value in root["shortcuts"].items()
+                         if value.get("DevkitGameID") == "External-Tool"}
+    vdf.write_bytes(a.vdf_encode(root))
+    replay = a._devkit_reconcile_worker()
+    assert replay["state"] == "done" and sorted(replay["created"]) == ["com.x.alpha", "com.x.beta"]
+    assert "External-Tool" in a.devkit_list_gameids() and create_count() == 4
+    repeated = a._devkit_reconcile_worker()
+    assert repeated["state"] == "done" and not repeated["created"] and create_count() == 4
+    assert not any("delete-shortcut" in line for line in sent)
+
+
+def test_devkit_reconcile_defers_until_pipe_ready_then_retries(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.y"
+    anchor.mkdir(parents=True)
+    (anchor / "launch.sh").write_text("#!/bin/sh\n")
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.y", "appid": 1, "title": "X",
+                                                        "base": str(anchor)}))
+    sent, _ = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    real_list = a.devkit_list_gameids
+    calls = []
+
+    def not_ready_once(timeout=15):
+        calls.append(1)
+        if len(calls) == 1:
+            raise a.DevkitUnavailable("Steam's devkit command pipe isn't ready")
+        return real_list(timeout=timeout)
+
+    monkeypatch.setattr(a, "devkit_list_gameids", not_ready_once)
+    deferred = a.cmd_reconcile_devkit({"packages": ["com.x.y"]})
+    state = json.loads(Path(a.DEVKIT_REGISTRY).read_text())
+    assert deferred["state"] == "deferred" and "com.x.y" in state["active"]
+    assert not any("create-shortcut" in line for line in sent)
+
+    monkeypatch.setattr(a, "devkit_list_gameids", real_list)
+    retried = a._devkit_reconcile_worker()
+    assert retried["created"] == ["com.x.y"] and any("create-shortcut" in line for line in sent)
+
+
+def test_devkit_uninstall_tombstone_retries_exact_owned_delete(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.y"
+    anchor.mkdir(parents=True)
+    (anchor / "launch.sh").write_text("#!/bin/sh\n")
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.y", "appid": 1, "title": "X",
+                                                        "base": str(anchor)}))
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    assert a.devkit_register("com.x.y") == 2772269798
+    root = a.vdf_decode(vdf.read_bytes())
+    root["shortcuts"]["99"] = {"appname": "External", "Exe": '"/external/KeepMe/launch.sh"',
+                                "appid": 123, "Devkit": 1, "DevkitGameID": "KeepMe"}
+    vdf.write_bytes(a.vdf_encode(root))
+    real_request = a.devkit_request
+
+    def fail_delete(command, timeout=15):
+        if command.startswith("delete-shortcut"):
+            raise a.DevkitUnavailable("Steam's devkit command pipe isn't ready")
+        return real_request(command, timeout)
+
+    monkeypatch.setattr(a, "devkit_request", fail_delete)
+    with pytest.raises(a.DevkitUnavailable):
+        a.devkit_unregister("com.x.y", steam_running=True)
+    state = json.loads(Path(a.DEVKIT_REGISTRY).read_text())
+    assert "com.x.y" not in state["active"] and state["tombstones"]["com.x.y"]["gameid"] == "X"
+    assert (tmp_path / "devkit-game/X").exists()  # preserve cleanup identity until Steam confirms deletion
+
+    monkeypatch.setattr(a, "devkit_request", real_request)
+    finished = a._devkit_reconcile_worker()
+    assert finished["removed"] == ["com.x.y"]
+    assert not json.loads(Path(a.DEVKIT_REGISTRY).read_text())["tombstones"]
+    assert not (tmp_path / "devkit-game/X").exists()
+    assert "KeepMe" in a.devkit_list_gameids()
+    assert not any("delete-shortcut" in line and "KeepMe" in line for line in sent)
+
+
+def test_devkit_offline_uninstall_removes_only_its_exact_vdf_row(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.y"
+    anchor.mkdir(parents=True)
+    (anchor / "launch.sh").write_text("#!/bin/sh\n")
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.y", "appid": 1, "title": "X",
+                                                        "base": str(anchor)}))
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(a.time, "sleep", lambda s: None)
+    a.devkit_register("com.x.y")
+    a.upsert_shortcut(str(vdf), f'"{anchor}/launch.sh"', "Normal FramePort entry", str(anchor), "")
+    a.upsert_shortcut(str(vdf), '"/external/other.sh"', "Other", "/external", "")
+    assert a.devkit_unregister("com.x.y", steam_running=False)
+    values = a.vdf_decode(vdf.read_bytes())["shortcuts"].values()
+    exes = {item["Exe"] for item in values}
+    assert f'"{anchor}/launch.sh"' in exes
+    assert '"/external/other.sh"' in exes
+    assert f'"{a.DEVKIT_GAMES}/X/launch.sh"' not in exes
+    assert not json.loads(Path(a.DEVKIT_REGISTRY).read_text())["tombstones"]
+    assert not any("delete-shortcut" in line for line in sent)
+
+
+def test_devkit_service_is_self_contained_and_periodic(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: calls.append(cmd) or
+                        SimpleNamespace(returncode=0, stdout="", stderr=""))
+    installed = a._install_devkit_service()
+    assert Path(installed["agent_copy"]).read_bytes() == AGENT.read_bytes()
+    service = Path(installed["service"]).read_text()
+    timer = Path(installed["timer"]).read_text()
+    assert "_devkit_reconcile_worker" in service and installed["agent_copy"] in service
+    assert "reconcile_devkit" in a.COMMANDS
+    assert str(AGENT) not in service and "TimeoutStartSec=8min" in service
+    assert "OnBootSec=1min" in timer and "OnUnitActiveSec=1min" in timer
+    assert calls == [["systemctl", "--user", "daemon-reload"],
+                     ["systemctl", "--user", "enable", "--now", "frameport-devkit-reconcile.timer"]]
+    a._remove_devkit_service()
+    assert not Path(installed["service"]).exists() and not Path(installed["timer"]).exists()
+    assert calls[-2:] == [["systemctl", "--user", "disable", "--now", "frameport-devkit-reconcile.timer",
+                           "frameport-devkit-reconcile.service"],
+                          ["systemctl", "--user", "daemon-reload"]]
+
+
+def test_devkit_list_rejects_unknown_protocol_without_guessing(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    monkeypatch.setattr(a, "devkit_request", lambda command, timeout=15: '{"version":1,"gameids":[]}')
+    with pytest.raises(a.AgentError, match="unsupported devkit shortcut list"):
+        a.devkit_list_gameids()
+
+
+def test_devkit_fifo_without_reader_and_missing_pipe_fail_without_blocking_or_creating(monkeypatch, tmp_path):
+    import stat
+    import time
+
+    a = load_agent(monkeypatch, tmp_path)
+    steam = tmp_path / ".steam"
+    steam.mkdir()
+    (steam / "steam.token").write_text("tok")
+    pipe = steam / "steam.pipe"
+    started = time.monotonic()
+    with pytest.raises(a.DevkitUnavailable, match="command pipe isn't ready"):
+        a.devkit_request("list-shortcuts?response={response}", timeout=1)
+    assert time.monotonic() - started < 0.5 and not pipe.exists()
+
+    os.mkfifo(pipe)
+    started = time.monotonic()
+    with pytest.raises(a.DevkitUnavailable, match="command pipe isn't ready"):
+        a.devkit_request("list-shortcuts?response={response}", timeout=1)
+    assert time.monotonic() - started < 0.5 and stat.S_ISFIFO(pipe.stat().st_mode)
+
+
+def test_timer_adopts_missing_old_gui_entries_but_keeps_normal_rows_and_external_ids(
+        monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    for pkg, title in (("com.x.legacy", "Legacy"), ("com.x.normal", "Normal")):
+        anchor = tmp_path / "Applications/quest-frame" / pkg
+        anchor.mkdir(parents=True)
+        (anchor / "launch.sh").write_text("#!/bin/sh\n")
+        (anchor / "deployment.json").write_text(json.dumps({"package": pkg, "appid": 1, "title": title,
+                                                              "base": str(anchor)}))
+    sent, vdf = _fake_steam(a, tmp_path, request)
+    normal = a.normal_shortcut_exe("com.x.normal")
+    a.upsert_shortcut(str(vdf), normal, "Keep normal", str(tmp_path), "")
+    external = '"/home/steamos/devkit-game/External/launch.sh"'
+    a.upsert_shortcut(str(vdf), external, "External", "/home/steamos")
+    root = a.vdf_decode(vdf.read_bytes())
+    root["shortcuts"]["1"].update(appid=444, Devkit=1, DevkitGameID="External")
+    vdf.write_bytes(a.vdf_encode(root))
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+    result = a._devkit_reconcile_worker()
+    registry = json.loads(Path(a.DEVKIT_REGISTRY).read_text())
+    assert result["state"] == "done" and result["adopted"] == ["com.x.legacy"]
+    assert result["created"] == ["com.x.legacy"] and set(registry["active"]) == {"com.x.legacy"}
+    ids = a.devkit_list_gameids()
+    assert "External" in ids and a.devkit_gameid("com.x.legacy") in ids
+    assert a.normal_shortcut_exe("com.x.normal") in {
+        item["Exe"] for item in a.vdf_decode(vdf.read_bytes())["shortcuts"].values()}
+    assert not any("delete-shortcut" in line for line in sent)
+
+
+def test_shortcut_retry_uses_selective_devkit_fallback_and_reports_partial(monkeypatch, tmp_path, request):
+    a = load_agent(monkeypatch, tmp_path)
+    packages = ["com.x.lost", "com.x.deferred", "com.x.kept"]
+    for pkg in packages:
+        anchor = tmp_path / "Applications/quest-frame" / pkg
+        anchor.mkdir(parents=True)
+        (anchor / "launch.sh").write_text("#!/bin/sh\n")
+        (anchor / "deployment.json").write_text(json.dumps({"package": pkg, "appid": 1, "title": pkg,
+                                                              "base": str(anchor)}))
+    sent, _vdf = _fake_steam(a, tmp_path, request)
+    monkeypatch.setattr(a, "refresh_desktop_entries", lambda: None)
+    monkeypatch.setattr(a, "library_users", lambda: ["42"])
+    monkeypatch.setattr(a, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(a, "library_changes", lambda users, pkgs: True)
+    monkeypatch.setattr(a, "game_running", lambda: False)
+    monkeypatch.setattr(a, "desktop_mode", lambda: False)
+    monkeypatch.setattr(a, "stop_steam", lambda: True)
+    monkeypatch.setattr(a, "start_steam", lambda service: None)
+    updated = []
+    monkeypatch.setattr(a, "update_library", lambda user, pkgs, result, shortcuts=True: updated.append(list(pkgs)))
+    monkeypatch.setattr(a, "shortcuts_lost", lambda users, pkgs: ["com.x.lost", "com.x.deferred"])
+    real_register = a.devkit_register
+
+    def register(pkg):
+        if pkg == "com.x.deferred":
+            raise a.DevkitUnavailable("Steam's command FIFO has no reader")
+        return real_register(pkg)
+
+    monkeypatch.setattr(a, "devkit_register", register)
+    a._shortcuts_worker(json.dumps({"packages": packages, "remove": [], "restart": True}))
+    result = json.loads(Path(a.STATUS_FILE).read_text())
+    assert updated == [packages, ["com.x.lost", "com.x.deferred"]]
+    assert result["state"] == "partial" and result["devkit_fallback"] == ["com.x.lost"]
+    assert result["deferred"] == ["com.x.deferred"]
+    assert {item["package"] for item in result["added"]} == {"com.x.lost"}
+    assert all("com.x.kept" != item["package"] for item in result["added"])
+    assert any("create-shortcut" in line and "gameid=com_x_lost" in line for line in sent)
+    assert not any("gameid=com_x_deferred" in line or "gameid=com_x_kept" in line for line in sent)
+
+
+def test_shortcut_retry_reports_deferred_when_every_lost_route_waits_for_steam(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = tmp_path / "Applications/quest-frame/com.x.lost"
+    anchor.mkdir(parents=True)
+    (anchor / "launch.sh").write_text("#!/bin/sh\n")
+    (anchor / "deployment.json").write_text(json.dumps({"package": "com.x.lost", "appid": 1, "title": "Lost",
+                                                        "base": str(anchor)}))
+    monkeypatch.setattr(a, "refresh_desktop_entries", lambda: None)
+    monkeypatch.setattr(a, "library_users", lambda: ["42"])
+    monkeypatch.setattr(a, "library_changes", lambda users, pkgs: True)
+    monkeypatch.setattr(a, "game_running", lambda: False)
+    monkeypatch.setattr(a, "desktop_mode", lambda: False)
+    monkeypatch.setattr(a, "stop_steam", lambda: True)
+    monkeypatch.setattr(a, "start_steam", lambda service: None)
+    monkeypatch.setattr(a, "update_library", lambda user, pkgs, result, shortcuts=True: None)
+    monkeypatch.setattr(a, "shortcuts_lost", lambda users, pkgs: ["com.x.lost"])
+    monkeypatch.setattr(a, "devkit_register", lambda pkg: (_ for _ in ()).throw(
+        a.DevkitUnavailable("Steam's command FIFO has no reader")))
+    a._shortcuts_worker(json.dumps({"packages": ["com.x.lost"], "remove": [], "restart": True}))
+    result = json.loads(Path(a.STATUS_FILE).read_text())
+    assert result["state"] == "deferred" and result["deferred"] == ["com.x.lost"]
 
 
 def test_launch_falls_back_to_devkit_entry(monkeypatch, tmp_path):
