@@ -3,12 +3,14 @@ method with its address. FramePort needs it only for Unity games whose text fiel
 so it is downloaded on first use into <user data>/tools/ (a self-contained executable per OS; no .NET install).
 
 Its current releases are all pre-releases (the 2022.1 line is the one that reads Unity 6 / metadata v31), so the
-newest release with an asset for this computer is used. Override: FRAMEPORT_CPP2IL=<path to the executable>."""
+newest release with an asset for this computer is used. Managed macOS copies get a local ad-hoc signature. Override:
+FRAMEPORT_CPP2IL=<path to the executable> (used as-is)."""
 from __future__ import annotations
 
 import os
 import platform
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,11 +51,54 @@ def installed_version() -> str | None:
     return p.parent.name.removeprefix("cpp2il-") if p is not None and p.parent.name.startswith("cpp2il-") else None
 
 
+def _codesign_detail(result) -> str:
+    return (result.stderr or result.stdout or f"exit code {result.returncode}").strip()[:300]
+
+
+def _ensure_macos_signature(exe: Path) -> None:
+    """Ad-hoc sign a managed macOS tool when its current signature is absent or invalid."""
+    try:
+        verification = subprocess.run(["codesign", "--verify", "--strict", str(exe)],
+                                      capture_output=True, text=True, errors="replace")
+    except OSError as exc:
+        raise RuntimeError("Apple's codesign command is required to run the managed Cpp2IL tool on macOS; "
+                           "install the Xcode Command Line Tools and retry.") from exc
+    if verification.returncode == 0:
+        return
+    try:
+        signed = subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", str(exe)],
+                                capture_output=True, text=True, errors="replace")
+    except OSError as exc:
+        raise RuntimeError(f"Cpp2IL's existing signature is invalid ({_codesign_detail(verification)}), and local "
+                           "ad-hoc signing could not start; install the Xcode Command Line Tools and retry.") from exc
+    if signed.returncode != 0:
+        raise RuntimeError(f"Cpp2IL's existing signature is invalid ({_codesign_detail(verification)}), and local "
+                           f"ad-hoc signing failed: {_codesign_detail(signed)}")
+    try:
+        verification = subprocess.run(["codesign", "--verify", "--strict", str(exe)],
+                                      capture_output=True, text=True, errors="replace")
+    except OSError as exc:
+        raise RuntimeError("Cpp2IL was ad-hoc signed, but its signature could not be verified; install the Xcode "
+                           "Command Line Tools and retry.") from exc
+    if verification.returncode != 0:
+        raise RuntimeError(f"Cpp2IL was ad-hoc signed locally, but signature verification failed: "
+                           f"{_codesign_detail(verification)}")
+
+
+def _prepare_managed_tool(exe: Path) -> Path:
+    """Ad-hoc sign a managed copy on macOS before returning it."""
+    if sys.platform == "darwin":
+        _ensure_macos_signature(exe)
+    return exe
+
+
 def ensure(progress=None) -> Path:
     """The Cpp2IL executable, downloading it first if needed."""
     existing = path()
     if existing is not None and existing.exists():
-        return existing
+        if os.environ.get("FRAMEPORT_CPP2IL"):
+            return existing  # Explicit user overrides are used as-is and never rewritten.
+        return _prepare_managed_tool(existing)
     releases = cache.cached_json("cpp2il-releases.json", RELEASES, max_age=7 * 86400, fallback=[]) or []
     picked = pick_release(releases, asset_suffix())
     if picked is None:
@@ -62,4 +107,4 @@ def ensure(progress=None) -> Path:
     exe = tools_dir() / f"cpp2il-{version}" / ("Cpp2IL.exe" if sys.platform == "win32" else "Cpp2IL")
     cache.download(url, exe, progress)
     exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return exe
+    return _prepare_managed_tool(exe)
