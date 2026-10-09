@@ -77,34 +77,37 @@ def build(source: SourceGame, analysis: Analysis, recipe: Recipe, outdir: Path, 
     alt_copy = Path(source.apk).with_name(f"{pkg}.alt-noforcequit.apk")
     results = {}
     all_checks, applied, superseded = [], [], {}
+    from .analysis.il2cpp import cpp2il_attempt_scope
+
     try:
-        for variant, alt in variants:
-            input_apk = alt_copy if converted and alt and alt_copy.exists() else Path(source.apk)
-            if recipe.overport and (not converted or alt and input_apk == Path(source.apk)):
-                reporter.stage(f"OVRPort ({variant})")
-                ids = overport_ids(recipe, alt)
-                patched = overport_tool.patch(source.apk, work, f"{pkg}.{variant}.overport.apk", ids, reporter)
-            else:  # an ordinary Android app, or an already converted build: only the Frame patches it needs
-                if recipe.overport:
-                    reporter.log(f"{input_apk.name} is already converted: applying only the Steam Frame patches")
-                patched = work / f"{pkg}.{variant}.original.apk"
-                shutil.copyfile(input_apk, patched)
-            reporter.stage(f"Frame fixes ({variant})")
-            unsigned = work / f"{pkg}.{variant}.unsigned.apk"
-            applied, checks, left_out = apply_frame_fixes(patched, unsigned, analysis, recipe, reporter)
-            if variant == "primary":
-                superseded = left_out
-            patched.unlink(missing_ok=True)
-            reporter.stage(f"sign ({variant})")
-            final = outdir / (f"{pkg}.apk" if not alt else f"{pkg}.alt-noforcequit.apk")
-            sign.sign(unsigned, final, pkg)
-            unsigned.unlink(missing_ok=True)
-            reporter.stage(f"validate ({variant})")
-            checks += check_apk(final, pkg, expect_adapter=recipe.overport)
-            for c in checks:
-                reporter.check(c["name"], c["ok"], c["detail"])
-            results[variant] = final
-            all_checks += [{**c, "variant": variant} for c in checks]
+        with cpp2il_attempt_scope():
+            for variant, alt in variants:
+                input_apk = alt_copy if converted and alt and alt_copy.exists() else Path(source.apk)
+                if recipe.overport and (not converted or alt and input_apk == Path(source.apk)):
+                    reporter.stage(f"OVRPort ({variant})")
+                    ids = overport_ids(recipe, alt)
+                    patched = overport_tool.patch(source.apk, work, f"{pkg}.{variant}.overport.apk", ids, reporter)
+                else:  # an ordinary Android app, or an already converted build: only the Frame patches it needs
+                    if recipe.overport:
+                        reporter.log(f"{input_apk.name} is already converted: applying only the Steam Frame patches")
+                    patched = work / f"{pkg}.{variant}.original.apk"
+                    shutil.copyfile(input_apk, patched)
+                reporter.stage(f"Frame fixes ({variant})")
+                unsigned = work / f"{pkg}.{variant}.unsigned.apk"
+                applied, checks, left_out = apply_frame_fixes(patched, unsigned, analysis, recipe, reporter)
+                if variant == "primary":
+                    superseded = left_out
+                patched.unlink(missing_ok=True)
+                reporter.stage(f"sign ({variant})")
+                final = outdir / (f"{pkg}.apk" if not alt else f"{pkg}.alt-noforcequit.apk")
+                sign.sign(unsigned, final, pkg)
+                unsigned.unlink(missing_ok=True)
+                reporter.stage(f"validate ({variant})")
+                checks += check_apk(final, pkg, expect_adapter=recipe.overport)
+                for c in checks:
+                    reporter.check(c["name"], c["ok"], c["detail"])
+                results[variant] = final
+                all_checks += [{**c, "variant": variant} for c in checks]
     finally:
         if not keep_work:
             shutil.rmtree(work, ignore_errors=True)
