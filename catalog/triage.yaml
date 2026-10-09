@@ -18,6 +18,11 @@ signatures:
     severity: fatal
     diagnosis: 32-bit-only APK. The Steam Frame has no AArch32; this cannot run. Use the PC (Rift) version via Revive.
     suggest: []
+  - id: obb-loop-device-unavailable
+    pattern: 'Failed to open loop-control: No such file or directory'
+    severity: fatal
+    diagnosis: vold cannot open the loop-control device needed to mount this Android OBB in the current Lepton container. Apps that require mounted OBB contents need a runtime with working OBB mounts or a loader adapted to read/extract the data into app-readable storage. This signature identifies the mount failure; it does not establish that a later app crash was caused by it.
+    suggest: []
   - id: android-too-new
     pattern: '(NoClassDefFoundError|ClassNotFoundException|NoSuchMethodError)\b.*(Landroid/window/|android\.window\.|(storeStoreFence|loadLoadFence)\(\)V in class Ljava/lang/invoke/VarHandle)'
     severity: fatal

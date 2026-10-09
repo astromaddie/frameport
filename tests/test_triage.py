@@ -62,6 +62,65 @@ def test_crash_logcat_signatures():
     assert [(f.id, f.suggest) for f in r.findings] == [("swapchain-size-abort", ["frame.swapchain_limit"])]
 
 
+def test_obb_mount_reports_missing_loop_control_without_claiming_crash_causality():
+    # Exact vold/ObbLoader messages from the captured Civilization VII Lepton launch.
+    log = ("10-09 11:07:10.080   218   233 I ActivityManager: Start proc 1213:com.example.game/u0a14 for activity\n"
+           "10-09 11:07:23.355    20    28 E vold    : Failed to open loop-control: No such file or directory\n"
+           "10-09 11:07:23.355    20    28 E vold    : obb:0 failed to create loop: No such file or directory\n"
+           "10-09 11:07:23.356    20    28 E vold    : obb:0 failed to mount: Operation not permitted\n"
+           "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"
+           "com.example.game/main.1.com.example.game.obb; state=21\n"
+           "10-09 11:07:23.413  1213  1242 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR)\n")
+    r = triage(log, "EXITED", "com.example.game")
+    findings = {f.id: f for f in r.findings}
+    assert findings["obb-loop-device-unavailable"].severity == "fatal"
+    assert findings["native-crash"].id == "native-crash"  # the mount log does not explain a subsequent crash
+    assert r.suggestions() == []
+
+
+def test_obb_state_21_alone_does_not_imply_missing_loop_control():
+    # State 21 is a generic mount failure; classify this cause only when vold logs its loop-control error.
+    log = "ObbLoader: path=/storage/emulated/0/Android/obb/com.example.game/data.obb; state=21\n"
+    r = triage(log, "EXITED", "com.example.game")
+    assert "obb-loop-device-unavailable" not in {f.id for f in r.findings}
+
+    # Similar-looking states are not the exact Android OBB mount failure code.
+    state_210 = ("10-09 11:07:23.355    20    28 E vold    : Failed to open loop-control: No such file or directory\n"
+                 "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"
+                 "com.example.game/data.obb; state=210\n")
+    assert "obb-loop-device-unavailable" not in {f.id for f in triage(state_210, "EXITED", "com.example.game").findings}
+
+
+def test_old_vold_loop_error_not_attributed_to_later_obb_mount_failure():
+    log = ("10-09 11:06:00.000    20    28 E vold    : Failed to open loop-control: No such file or directory\n"
+           "10-09 11:07:10.080   218   233 I ActivityManager: Start proc 1213:com.example.game/u0a14 for activity\n"
+           "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"
+           "com.example.game/data.obb; state=21\n")
+    r = triage(log, "EXITED", "com.example.game")
+    assert "obb-loop-device-unavailable" not in {f.id for f in r.findings}
+
+
+def test_uncorrelated_vold_loop_error_is_filtered_with_or_without_package():
+    stray = "10-09 11:07:23.355    20    28 E vold    : Failed to open loop-control: No such file or directory\n"
+    assert "obb-loop-device-unavailable" not in {f.id for f in triage(stray, "EXITED").findings}
+
+    # Without a Start proc line, game_lines keeps all messages; an unrelated package callback must not match.
+    unrelated = (stray + "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"
+                 "com.other.app/data.obb; state=21\n")
+    assert "obb-loop-device-unavailable" not in {
+        f.id for f in triage(unrelated, "EXITED", "com.example.game").findings
+    }
+
+
+def test_app_message_cannot_impersonate_vold_loop_control_error():
+    log = ("10-09 11:07:23.355  1213  1242 E Game: Failed to open loop-control: No such file or directory\n"
+           "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"
+           "com.example.game/data.obb; state=21\n")
+    assert "obb-loop-device-unavailable" not in {
+        f.id for f in triage(log, "EXITED", "com.example.game").findings
+    }
+
+
 def test_ovrplugin_extension_probe_is_not_a_scene_game():
     probe = LOG_OK + "09-28 17:39:02.200  1147  1174 I OVRPlugin: Unavailable OpenXR extension: XR_FB_scene\n"
     assert "scene-missing" not in {f.id for f in triage(probe, "RUNNING", "com.example.game").findings}

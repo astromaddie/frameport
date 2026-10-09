@@ -78,11 +78,64 @@ def game_lines(log: str, package: str | None = None) -> list[str]:
     return out
 
 
+_LOGCAT_TIME = re.compile(r"^(\d\d-\d\d) (\d\d):(\d\d):(\d\d)\.(\d{3})")
+_OBB_LOOP_CONTROL = "Failed to open loop-control: No such file or directory"
+_OBB_STATE_FAILED = re.compile(r"(?:^|[;\s])state=21(?:\s|$)")
+
+
+def _obb_loop_errors_for_game(log_lines: list[str], selected_lines: list[str], package: str | None) -> list[str]:
+    """Keep vold's loop error only when it coincides with this game's failed OBB mount callback.
+
+    vold runs as a system process, so game_lines() normally drops its messages. Pairing the error with the selected
+    app's package-specific ObbLoader state=21 callback avoids attributing stale/unrelated system errors to a game.
+    """
+    def timestamp(line: str) -> tuple[str, int] | None:
+        m = _LOGCAT_TIME.match(line)
+        if not m:
+            return None
+        day = m[1]
+        millis = (((int(m[2]) * 60 + int(m[3])) * 60 + int(m[4])) * 1000 + int(m[5]))
+        return day, millis
+
+    obb_failures = []
+    for line in selected_lines:
+        if "ObbLoader:" not in line or not _OBB_STATE_FAILED.search(line):
+            continue
+        obb_path = f"/Android/obb/{package}/" if package else None
+        if obb_path and obb_path not in line:
+            continue
+        if not obb_path and not re.search(r"/Android/obb/[^/\s]+/", line):
+            continue
+        stamp = timestamp(line)
+        if stamp:
+            obb_failures.append(stamp)
+    if not obb_failures:
+        return []
+
+    correlated = []
+    for line in log_lines:
+        fields = line.split(maxsplit=6)
+        if (len(fields) < 7 or fields[5] != "vold" or _OBB_LOOP_CONTROL not in fields[6]):
+            continue
+        stamp = timestamp(line)
+        if not stamp:
+            continue
+        if any(day == stamp[0] and abs(millis - stamp[1]) <= 1000 for day, millis in obb_failures):
+            correlated.append(line)
+    return correlated
+
+
 def triage(log: str, state: str = "UNKNOWN", package: str | None = None, crash: str = "") -> TriageResult:
     """`crash` = the container's crash logcat (tombstones come from crash_dump's pid, so it isn't pid-filtered)."""
     db = database()
     kind = "pcvr" if package and package.startswith("rift.") else "quest"  # Proton/Revive logs vs Lepton logcat
-    lines = game_lines(log, package) if kind == "quest" else [ANSI.sub("", ln) for ln in log.splitlines()]
+    raw_lines = [ANSI.sub("", ln) for ln in log.splitlines()]
+    lines = game_lines(log, package) if kind == "quest" else raw_lines
+    if kind == "quest":
+        loop_errors = _obb_loop_errors_for_game(raw_lines, lines, package)
+        # System log lines are normally filtered for a package-specific triage; even without a package, strip
+        # uncorrelated loop messages so an earlier/unrelated failure cannot trigger this game's diagnosis.
+        lines = [ln for ln in lines if _OBB_LOOP_CONTROL not in ln] + loop_errors
     lines += [ANSI.sub("", ln) for ln in crash.splitlines()]
     text = "\n".join(lines)
     res = TriageResult(state, None)
