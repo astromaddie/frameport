@@ -33,6 +33,11 @@ signatures:
     severity: fatal
     diagnosis: Unity's render thread crashed inside the Frame's GL driver (Mesa/Zink); the picture freezes or stays grey. Known triggers - an OVROverlay copy (try "Unity - skip OVROverlay layers", e.g. The Room VR), MSAA switched on at runtime, a GPU hang (zink DEVICE LOST).
     suggest: [frame.unity_no_overlay_copy, frame.unity_runtime_msaa_off]
+  - id: unity-overlay-swapchain-failed
+    pattern: 'xrCreateSwapchain\s+16x16\b.*\bfaces=6\b.*\bresult=-2\b'
+    severity: fatal
+    diagnosis: Unity's OVROverlay tried to create a tiny six-face cubemap swapchain and the Frame runtime rejected it; Unity then null-dereferences during overlay initialization.
+    suggest: [frame.unity_no_overlay_copy]
   - id: swapchain-rect-invalid
     pattern: 'xrEndFrame failed -25\b'
     severity: fatal

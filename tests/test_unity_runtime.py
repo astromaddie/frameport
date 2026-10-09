@@ -49,6 +49,34 @@ def test_runtime_msaa_suggested_for_gles_ovr_games_only():
     assert not base.get("frame.unity_multipass").applies(_analysis(libs=["libunity.so"]))  # Mono: no Cpp2IL
 
 
+def test_overlay_patch_skips_swapchain_creation_before_layer_population():
+    lib = _lib()
+    lo, _hi = U._executable(lib)[0]
+    create, populate = (lo + 0x40) & ~3, (lo + 0x80) & ~3
+    targets = R.UnityNoOverlayCopy.targets["Oculus.VR/OVROverlay.cs"]
+    found = {"Oculus.VR/OVROverlay.cs": {
+        "CreateLayer": (create, 0x100), "PopulateLayer": (populate, 0x100)}}
+
+    patched, notes = U.patch_methods(lib, found, {"Oculus.VR/OVROverlay.cs": targets})
+
+    assert patched is not None
+    assert patched[create:create + 8] == R.RET_ZERO
+    assert patched[populate:populate + 8] == R.RET_ZERO
+    assert patched[create + 8:create + 12] == lib[create + 8:create + 12]
+    assert any("CreateLayer" in note for note in notes)
+    assert any("PopulateLayer" in note for note in notes)
+
+
+def test_cube_overlay_swapchain_failure_suggests_overlay_patch():
+    log = ("10-09 01:47:40.199  1232  1311 I FrameBridge: xrCreateSwapchain 16x16 format=35907 "
+           "samples=1 array=1 faces=6 usage=0x21 flags=0x0 result=-2\n")
+    findings = triage(log, "EXITED", "com.greensky.swarm2").findings
+
+    finding, = [f for f in findings if f.id == "unity-overlay-swapchain-failed"]
+    assert finding.severity == "fatal"
+    assert finding.suggest == ["frame.unity_no_overlay_copy"]
+
+
 def test_triage_points_runtime_msaa_to_the_patch():
     log = ("09-28 17:39:01.000  1000  1000 I ActivityManager: Start proc 1147:com.example.game/u0a55 for activity\n"
            "09-28 17:39:04.000  1147  1174 I Unity   : The current MSAA level is 0, but the recommended MSAA level is "
@@ -127,6 +155,7 @@ def test_recipe_changes_and_revised_patches_mark_builds_outdated():
     assert recipe_changed(game)
     assert not revised_since_unrecorded({"patches": {"frame.unity_text_input": {}}})
     assert revised_since_unrecorded({"patches": {"frame.unity_multipass": {}}})  # fixed after 0.6.3
+    assert revised_since_unrecorded({"patches": {"frame.unity_no_overlay_copy": {}}})
     assert revised_since_unrecorded({"patches": {"adapter.vk_shader_fix": {"value": "x"}}})  # needs the new shim
 
 

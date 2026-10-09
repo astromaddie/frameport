@@ -1,8 +1,11 @@
 """Unity text fields on the Frame: Cpp2IL output parsing, the release pick, the byte patch and the detection."""
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from frameport.analysis import il2cpp
 from frameport.analysis.detect import unity_text_fields, unity_version
 from frameport.analysis.il2cpp import _plain_version, parse_methods
 from frameport.patches.frame import unity_text_input as U
@@ -29,6 +32,108 @@ def test_parse_methods_reads_file_offsets():
     found = parse_methods(CS, ["TouchScreenKeyboardShouldBeUsed", "isKeyboardUsingEvents", "Missing"])
     assert found == {"TouchScreenKeyboardShouldBeUsed": (0x71988F0, 0xB8), "isKeyboardUsingEvents": (0x7194A78, 0x10C)}
     assert _plain_version("6000.2.7f2") == "6000.2.7" and _plain_version("2021.3.45f1") == "2021.3.45"
+
+
+def test_find_methods_reruns_when_a_class_cache_lacks_a_new_method_target(monkeypatch, tmp_path):
+    class_file = "Oculus.VR/OVROverlay.cs"
+    cs = '''public class OVROverlay
+{
+\t[Address(RVA = "0x100", Offset = "0x100", Length = "0x20")]
+\t[Token(Token = "0x1")]
+\tprivate bool PopulateLayer() { }
+
+\t[Address(RVA = "0x200", Offset = "0x200", Length = "0x30")]
+\t[Token(Token = "0x2")]
+\tprivate bool CreateLayer() { }
+}
+'''
+    calls = []
+    monkeypatch.setattr(il2cpp, "cache_dir", lambda: tmp_path / "cache")
+
+    def cpp2il(args, **_kwargs):
+        calls.append(args)
+        output = Path(args[args.index("--output-to") + 1]) / "DiffableCs" / class_file
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(cs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(il2cpp.subprocess, "run", cpp2il)
+    lib, metadata, tool = b"lib", b"metadata", tmp_path / "Cpp2IL"
+    first = il2cpp.find_methods(lib, metadata, "2021.3.5f1", {class_file: ["PopulateLayer"]}, cpp2il=tool)
+    both = il2cpp.find_methods(lib, metadata, "2021.3.5f1",
+                               {class_file: ["CreateLayer", "PopulateLayer"]}, cpp2il=tool)
+    cached = json.loads(il2cpp._cache_file(lib, metadata).read_text())
+    again = il2cpp.find_methods(lib, metadata, "2021.3.5f1",
+                                {class_file: ["CreateLayer", "PopulateLayer"]}, cpp2il=tool)
+
+    assert first == {class_file: {"PopulateLayer": (0x100, 0x20)}}
+    assert both == {class_file: {"CreateLayer": (0x200, 0x30), "PopulateLayer": (0x100, 0x20)}}
+    assert again == both and len(calls) == 2
+    assert cached["searched"][class_file] == ["CreateLayer", "PopulateLayer"]
+
+
+def test_find_methods_caches_searched_but_absent_methods(monkeypatch, tmp_path):
+    class_file = "Oculus.VR/OVROverlay.cs"
+    cs = '''public class OVROverlay
+{
+\t[Address(RVA = "0x100", Offset = "0x100", Length = "0x20")]
+\t[Token(Token = "0x1")]
+\tprivate bool PopulateLayer() { }
+}
+'''
+    calls = []
+    monkeypatch.setattr(il2cpp, "cache_dir", lambda: tmp_path / "cache")
+
+    def cpp2il(args, **_kwargs):
+        calls.append(args)
+        output = Path(args[args.index("--output-to") + 1]) / "DiffableCs" / class_file
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(cs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(il2cpp.subprocess, "run", cpp2il)
+    wanted = {class_file: ["CreateLayer"]}
+    first = il2cpp.find_methods(b"lib", b"metadata", "2021.3.5f1", wanted, cpp2il=tmp_path / "Cpp2IL")
+    second = il2cpp.find_methods(b"lib", b"metadata", "2021.3.5f1", wanted, cpp2il=tmp_path / "Cpp2IL")
+
+    assert first == second == {class_file: {}}
+    assert len(calls) == 1
+
+
+def test_find_methods_migrates_legacy_cache_when_requested_method_was_not_recorded(monkeypatch, tmp_path):
+    class_file = "Oculus.VR/OVROverlay.cs"
+    lib, metadata = b"legacy-lib", b"legacy-metadata"
+    monkeypatch.setattr(il2cpp, "cache_dir", lambda: tmp_path / "cache")
+    cache_file = il2cpp._cache_file(lib, metadata)
+    cache_file.parent.mkdir(parents=True)
+    # Legacy caches recorded method offsets but not which absent methods had already been searched.
+    cache_file.write_text(json.dumps({"unity_version": "2021.3.5f1", "missing": [],
+                                      "classes": {class_file: {"PopulateLayer": [0x100, 0x20]}}}))
+    calls = []
+
+    def cpp2il(args, **_kwargs):
+        calls.append(args)
+        output = Path(args[args.index("--output-to") + 1]) / "DiffableCs" / class_file
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text('''public class OVROverlay
+{
+\t[Address(RVA = "0x100", Offset = "0x100", Length = "0x20")]
+\t[Token(Token = "0x1")]
+\tprivate bool PopulateLayer() { }
+}
+''')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(il2cpp.subprocess, "run", cpp2il)
+    wanted = {class_file: ["CreateLayer"]}
+    first = il2cpp.find_methods(lib, metadata, "2021.3.5f1", wanted, cpp2il=tmp_path / "Cpp2IL")
+    second = il2cpp.find_methods(lib, metadata, "2021.3.5f1", wanted, cpp2il=tmp_path / "Cpp2IL")
+
+    assert first == second == {class_file: {}}
+    assert len(calls) == 1
+    migrated = json.loads(cache_file.read_text())
+    assert migrated["searched"][class_file] == ["CreateLayer"]
+    assert migrated["classes"][class_file]["PopulateLayer"] == [0x100, 0x20]
 
 
 def test_pick_release_takes_the_newest_with_an_asset_for_this_computer():

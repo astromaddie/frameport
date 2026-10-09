@@ -4,7 +4,8 @@ in its "diffable C#" output with the attribute injector). Offset is the method's
 
 Results are cached per game build (its global-metadata.dat), so a rebuild of the same game doesn't run Cpp2IL again,
 and neither does the next patch of the same build (an earlier one has already changed libil2cpp.so's bytes, never its
-layout)."""
+layout). Each cache entry records which methods were searched in each class: adding a patch target to a class already
+in the cache triggers one new Cpp2IL run, while searched-but-absent methods and classes remain cached as missing."""
 from __future__ import annotations
 
 import hashlib
@@ -65,11 +66,17 @@ def find_methods(lib: bytes, metadata: bytes, unity_version: str, wanted: dict[s
     [method names]} -> {class file: {method: (file offset, length)}}; classes or methods not in the game are left
     out."""
     cache_file = _cache_file(lib, metadata)
+    cached = {}
     try:
         cached = json.loads(cache_file.read_text())
         if cached.get("error"):  # Cpp2IL can't read this build (e.g. an old Unity): don't run it again per patch
             raise RuntimeError(cached["error"])
-        if all(cls in cached.get("classes", {}) or cls in cached.get("missing", []) for cls in wanted):
+        classes = cached.get("classes", {})
+        missing = set(cached.get("missing", []))
+        searched = cached.get("searched", {})
+        if all(cls in classes or cls in missing for cls in wanted) and all(
+                cls in missing or set(names) <= set(classes.get(cls, {})) | set(searched.get(cls, []))
+                for cls, names in wanted.items()):
             return {cls: {m: tuple(v) for m, v in cached["classes"][cls].items() if m in names}
                     for cls, names in wanted.items() if cls in cached.get("classes", {})}
     except (OSError, ValueError, KeyError):
@@ -94,14 +101,21 @@ def find_methods(lib: bytes, metadata: bytes, unity_version: str, wanted: dict[s
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps({"unity_version": unity_version, "error": error}))
             raise RuntimeError(error)
-        out, missing = {}, []
+        out = {c: {m: tuple(v) for m, v in methods.items()} for c, methods in cached.get("classes", {}).items()}
+        missing = set(cached.get("missing", []))
+        searched = {c: set(names) for c, names in cached.get("searched", {}).items()}
         for cls, names in wanted.items():
+            searched.setdefault(cls, set()).update(names)
             f = root / cls
             if f.exists():
-                out[cls] = parse_methods(f.read_text(encoding="utf-8", errors="replace"), names)
+                out.setdefault(cls, {}).update(parse_methods(f.read_text(encoding="utf-8", errors="replace"), names))
+                missing.discard(cls)
             else:
-                missing.append(cls)
+                out.pop(cls, None)
+                missing.add(cls)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    cache_file.write_text(json.dumps({"unity_version": unity_version, "missing": missing,
+    cache_file.write_text(json.dumps({"unity_version": unity_version, "missing": sorted(missing),
+                                      "searched": {c: sorted(names) for c, names in searched.items()},
                                       "classes": {c: {m: list(v) for m, v in ms.items()} for c, ms in out.items()}}))
-    return out
+    return {cls: {m: out[cls][m] for m in names if m in out.get(cls, {})} for cls, names in wanted.items()
+            if cls in out}
