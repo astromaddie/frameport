@@ -40,7 +40,7 @@ import time
 import zlib
 from types import SimpleNamespace
 
-AGENT_VERSION = 66
+AGENT_VERSION = 67
 HOME = os.path.expanduser("~")
 STEAM = os.path.join(HOME, ".local/share/Steam")
 ANCHORS = os.path.join(HOME, "Applications/quest-frame")
@@ -1153,7 +1153,8 @@ def _shortcuts_worker(payload):
                 copy_grid_art(pkg, appid)
         args["packages"] = [p for p in args["packages"] if p not in devkit]
         result["devkit"] = devkit
-        if not args.get("remove") and not library_changes(users, args["packages"]):
+        if not args.get("remove") and not library_changes(users, args["packages"]) and \
+                not _normal_route_cleanup_pending():
             # nothing to change in shortcuts.vdf (e.g. a reinstall): only the artwork, no Steam restart
             for user in users:
                 update_library(user, args["packages"], result, shortcuts=False)
@@ -1175,6 +1176,7 @@ def _shortcuts_worker(payload):
             service = stop_steam()
         except AgentError:
             raise AgentError("Steam did not close; library not modified") from None
+        _cleanup_normal_routes_for_shortcuts_transaction(result)
         for user in steam_users():  # uninstalled games leave every account's library
             remove_from_library(user, args.get("remove", []), result)
         for user in users:
@@ -1560,6 +1562,13 @@ def _devkit_registry():
                 raise AgentError("FramePort's devkit ownership file has an invalid app ID; it was left unchanged")
             if "normal_cleanup_pending" in item and type(item["normal_cleanup_pending"]) is not bool:
                 raise AgentError("FramePort's devkit ownership file has an invalid route marker; it was left unchanged")
+            for marker in ("live_checked", "create_requested"):
+                if marker in item and type(item[marker]) is not bool:
+                    raise AgentError("FramePort's devkit ownership file has an invalid request marker; "
+                                     "it was left unchanged")
+            if item.get("create_requested") and item.get("live_checked") is False:
+                raise AgentError("FramePort's devkit ownership file has an inconsistent request marker; "
+                                 "it was left unchanged")
     owned_ids = [item["gameid"] for state in (registry["active"], registry["tombstones"])
                  for item in state.values()]
     if set(registry["active"]) & set(registry["tombstones"]) or len(set(owned_ids)) != len(owned_ids):
@@ -1622,6 +1631,27 @@ def _cleanup_normal_routes_locked(registry, result):
             result.setdefault("normal_removed", []).append(pkg)
 
 
+def _normal_route_cleanup_pending():
+    """Whether a user-initiated shortcuts transaction has an exact confirmed row to finish removing."""
+    try:
+        registry = _devkit_registry()
+    except AgentError:
+        return False
+    return any(record.get("normal_cleanup_pending") for record in registry["active"].values())
+
+
+def _cleanup_normal_routes_for_shortcuts_transaction(result):
+    """Clean exact pending rows only inside the existing user-initiated transaction after Steam has stopped."""
+    if not _normal_route_cleanup_pending():
+        return
+    lock = _devkit_lock()
+    try:
+        _cleanup_normal_routes_locked(_devkit_registry(), result)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
 def _shortcuts_packages_in_flight():
     """Packages whose ordinary library transaction still owns the shortcuts.vdf update window."""
     status = cmd_shortcut_status({})
@@ -1642,29 +1672,6 @@ def _shortcuts_packages_in_flight():
     active = status.get("state") in ("running", "waiting")
     age = time.time() - float(status.get("started") or 0)
     return set(packages) if active and age < 120 else set()
-
-
-def _cleanup_normal_routes_when_idle(registry, result):
-    """Use the ordinary shortcuts transaction lock so its whole-file write can't race our exact-row cleanup."""
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
-    try:
-        lock = open(STATUS_FILE + ".lock", "a")
-    except OSError:
-        return
-    acquired = False
-    try:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except BlockingIOError:
-            return
-        _cleanup_normal_routes_locked(registry, result)
-    finally:
-        try:
-            if acquired:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-        finally:
-            lock.close()
 
 
 def _devkit_status(result):
@@ -1878,11 +1885,16 @@ def devkit_list_gameids(timeout=15):
     return set(value["gameids"])
 
 
-def _devkit_new_gameid(pkg, dep, registry):
+def _devkit_new_gameid(pkg, dep, registry, live_ids=(), exclude_pkg=None):
     slug = re.sub(r"[^A-Za-z0-9]+", "_", dep.get("title") or pkg).strip("_")[:60] or pkg.replace(".", "_")
     slug = re.sub(r"[^A-Za-z0-9_]", "_", slug)
     reserved = {item["gameid"] for item in registry["active"].values()}
     reserved.update(item["gameid"] for item in registry["tombstones"].values())
+    if exclude_pkg:
+        current = registry["active"].get(exclude_pkg)
+        if current:
+            reserved.discard(current["gameid"])
+    reserved.update(live_ids or ())
     prefix = "Game_" if not slug[:1].isalpha() else ""
     base = slug[:64 - len(prefix)]
     n = 1
@@ -1907,21 +1919,9 @@ def _devkit_folder_conflicts(pkg, gameid):
         return True
 
 
-def _devkit_prepare_locked(pkg, registry):
-    """Persist a FramePort-owned ID before calling Steam, so a lost reply remains safely retryable."""
-    if pkg in registry["tombstones"]:
-        raise AgentError(f"{pkg} has a pending devkit removal; let Steam reconnect and retry first")
-    dep = deployment(pkg)
+def _devkit_prepare_sidecar(pkg, gameid):
+    """Write the local launcher files only after a candidate is ready to be submitted to Steam."""
     target = os.path.join(ANCHORS, pkg, "launch.sh")
-    if not dep or not os.path.isfile(target):
-        raise AgentError(f"{pkg} is not installed with a FramePort launcher")
-    linked = devkit_gameid(pkg)
-    record = registry["active"].get(pkg)
-    if record and linked and record["gameid"] != linked:
-        raise AgentError(f"{pkg} has a devkit ID that conflicts with FramePort's ownership record")
-    gameid = linked or (record or {}).get("gameid") or _devkit_new_gameid(pkg, dep, registry)
-    if not DEVKIT_GAMEID_RE.fullmatch(gameid):
-        raise AgentError(f"Invalid FramePort devkit ID for {pkg}")
     folder = os.path.join(DEVKIT_GAMES, gameid)
     os.makedirs(folder, exist_ok=True)
     link = os.path.join(folder, "launch.sh")
@@ -1941,10 +1941,90 @@ def _devkit_prepare_locked(pkg, registry):
         if not unchanged:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(encoded)
+
+
+def _devkit_remove_unrequested_sidecar(pkg, gameid):
+    """Remove only our exact pre-request files; preserve anything added to the sidecar directory by another tool."""
+    target = os.path.join(ANCHORS, pkg, "launch.sh")
+    folder = os.path.join(DEVKIT_GAMES, gameid)
+    link = os.path.join(folder, "launch.sh")
+    has_link = os.path.lexists(link)
+    if has_link:
+        if not os.path.islink(link) or os.readlink(link) != target:
+            raise AgentError(f"Unconfirmed devkit ID {gameid} now points to another launcher; left it unchanged")
+    metadata = []
+    for suffix, value in (("argv", ["launch.sh"]),
+                          ("settings", {"steam_play": "0", "compat_tool": ""})):
+        path = os.path.join(DEVKIT_GAMES, f"{gameid}-{suffix}.json")
+        try:
+            content = open(path, encoding="utf-8").read()
+        except FileNotFoundError:
+            continue
+        if content != json.dumps(value):
+            raise AgentError(f"Unconfirmed devkit ID {gameid} has unexpected local metadata; left it unchanged")
+        metadata.append(path)
+    if has_link:
+        os.remove(link)
+    for path in metadata:
+        os.remove(path)
+    try:
+        os.rmdir(folder)
+    except OSError:
+        pass
+
+
+def _devkit_prepare_locked(pkg, registry, live_ids=None):
+    """Reserve a candidate durably; unrequested IDs remain unowned until the live set is checked."""
+    if pkg in registry["tombstones"]:
+        raise AgentError(f"{pkg} has a pending devkit removal; let Steam reconnect and retry first")
+    dep = deployment(pkg)
+    target = os.path.join(ANCHORS, pkg, "launch.sh")
+    if not dep or not os.path.isfile(target):
+        raise AgentError(f"{pkg} is not installed with a FramePort launcher")
+    linked = devkit_gameid(pkg)
+    record = registry["active"].get(pkg)
+    if record and linked and record["gameid"] != linked:
+        raise AgentError(f"{pkg} has a devkit ID that conflicts with FramePort's ownership record")
+    if record and record.get("create_requested") is False:
+        if linked and linked != record["gameid"]:
+            raise AgentError(f"{pkg} has an unconfirmed devkit reservation with an unexpected launcher mapping")
+        if live_ids is None:
+            try:
+                live_ids = devkit_list_gameids()
+            except DevkitUnavailable:
+                return record["gameid"]
+        gameid = record["gameid"]
+        if not record.get("live_checked") or gameid in live_ids:
+            _devkit_remove_unrequested_sidecar(pkg, gameid)
+            gameid = _devkit_new_gameid(pkg, dep, registry, live_ids=live_ids, exclude_pkg=pkg)
+            record["gameid"] = gameid
+            record["live_checked"] = True
+            _save_devkit_registry(registry)
+        return gameid
+
+    if not linked and not record:
+        # A provisional ID survives an offline registration request, but no sidecar or Steam deletion authority
+        # is created until reconciliation has checked the live set and persisted a create request.
+        if live_ids is None:
+            try:
+                live_ids = devkit_list_gameids()
+            except DevkitUnavailable:
+                live_ids = None
+        gameid = _devkit_new_gameid(pkg, dep, registry, live_ids=live_ids)
+        registry["active"][pkg] = {"gameid": gameid, "appid": None,
+                                   "live_checked": live_ids is not None, "create_requested": False}
+        _save_devkit_registry(registry)
+        return gameid
+
+    gameid = linked or (record or {}).get("gameid")
+    if not DEVKIT_GAMEID_RE.fullmatch(gameid):
+        raise AgentError(f"Invalid FramePort devkit ID for {pkg}")
+    _devkit_prepare_sidecar(pkg, gameid)
     current = registry["active"].get(pkg)
     updated = {"gameid": gameid, "appid": (record or {}).get("appid")}
-    if (record or {}).get("normal_cleanup_pending"):
-        updated["normal_cleanup_pending"] = True
+    for marker in ("normal_cleanup_pending", "live_checked", "create_requested"):
+        if marker in (record or {}):
+            updated[marker] = record[marker]
     if current != updated:
         registry["active"][pkg] = updated
         _save_devkit_registry(registry)
@@ -2002,6 +2082,16 @@ def _devkit_reconcile_locked(packages=None, readiness_timeout=15):
         gameid = record["gameid"]
         try:
             if not deployment(pkg) or not os.path.isfile(os.path.join(ANCHORS, pkg, "launch.sh")):
+                if record.get("create_requested") is False:
+                    try:
+                        if devkit_gameid(pkg):
+                            _devkit_remove_unrequested_sidecar(pkg, gameid)
+                    except AgentError as exc:
+                        result["errors"].append(f"{pkg}: {exc}")
+                        continue
+                    registry["active"].pop(pkg, None)
+                    _save_devkit_registry(registry)
+                    continue
                 if _devkit_folder_conflicts(pkg, gameid):
                     result["errors"].append(f"{pkg}: devkit ID {gameid} now points to another launcher; "
                                              "removal was kept")
@@ -2018,8 +2108,28 @@ def _devkit_reconcile_locked(packages=None, readiness_timeout=15):
                 except (AgentError, OSError) as exc:
                     result["errors"].append(f"{pkg}: local cleanup pending: {exc}")
                 continue
-            _devkit_prepare_locked(pkg, registry)
+            gameid = _devkit_prepare_locked(pkg, registry, live_ids=live)
+            record = registry["active"][pkg]
             needs_art = False
+            if record.get("create_requested") is False:
+                # The candidate was not yet submitted to Steam. A live collision belongs to someone else, so
+                # reserve another ID before creating any local launcher files.
+                if gameid in live or not record.get("live_checked"):
+                    dep = deployment(pkg)
+                    gameid = _devkit_new_gameid(pkg, dep, registry, live_ids=live, exclude_pkg=pkg)
+                    record["gameid"] = gameid
+                    record["live_checked"] = True
+                    _save_devkit_registry(registry)
+                if gameid in live:
+                    raise AgentError(f"{pkg}: couldn't reserve a devkit ID absent from Steam's live list")
+                _devkit_prepare_sidecar(pkg, gameid)
+                record["create_requested"] = True
+                _save_devkit_registry(registry)
+            elif not record.get("create_requested"):
+                # A legacy mapping is already FramePort-owned. Record the create intent before a retry can lose
+                # its reply and leave a live entry whose origin would otherwise be ambiguous.
+                record["create_requested"] = True
+                _save_devkit_registry(registry)
             if gameid not in live:
                 from urllib.parse import quote_plus
 
@@ -2146,16 +2256,12 @@ def _devkit_reconcile_worker():
     lock = _devkit_lock()
     try:
         registry = _devkit_registry()
-        cleanup = {"state": "done", "created": [], "present": [], "removed": [], "pending": [], "errors": []}
-        _cleanup_normal_routes_when_idle(registry, cleanup)
         adopted, adoption_errors = _devkit_discover_legacy_locked(registry)
         result = _devkit_reconcile_locked(readiness_timeout=3)
         if adopted:
             result["adopted"] = adopted
-        result["errors"] = cleanup["errors"] + result["errors"] + adoption_errors
-        if cleanup.get("normal_removed"):
-            result["normal_removed"] = cleanup["normal_removed"]
-        if cleanup["errors"] or adoption_errors or result.get("pending"):
+        result["errors"] = result["errors"] + adoption_errors
+        if adoption_errors or result.get("pending"):
             if result["state"] != "deferred":
                 result["state"] = "partial"
         confirmed = set(result.get("created", [])) | set(result.get("present", []))
@@ -2191,6 +2297,13 @@ def devkit_unregister(pkg, steam_running=True):
     try:
         registry = _devkit_registry()
         record = registry["active"].get(pkg) or registry["tombstones"].get(pkg)
+        if record and record.get("create_requested") is False:
+            if devkit_gameid(pkg):
+                _devkit_remove_unrequested_sidecar(pkg, record["gameid"])
+            registry["active"].pop(pkg, None)
+            registry["tombstones"].pop(pkg, None)
+            _save_devkit_registry(registry)
+            return True
         gameid = devkit_gameid(pkg) or (record or {}).get("gameid")
         if not gameid:
             return False
