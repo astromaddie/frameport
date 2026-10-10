@@ -213,7 +213,7 @@ static XrResult focus_hold_poll(PFN_xrPollEvent fn, XrInstance instance, XrEvent
 #define MAX_POSE_ACTIONS 64
 static struct { XrAction action; int aim; } pose_actions[MAX_POSE_ACTIONS];
 static int pose_action_count;
-static struct { XrSpace space; XrPath subaction; int aim; } pose_spaces[MAX_POSE_ACTIONS];
+static struct { XrSpace space; XrPath subaction; int aim; int64_t last_log; } pose_spaces[MAX_POSE_ACTIONS];
 static int pose_space_count;
 static pthread_mutex_t pose_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -318,12 +318,14 @@ static XRAPI_ATTR XrResult XRAPI_CALL hook_xrSuggestInteractionProfileBindings(X
         (PFN_xrSuggestInteractionProfileBindings)lookup(instance, "xrSuggestInteractionProfileBindings");
     if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
     PFN_xrPathToString to_string = (PFN_xrPathToString)lookup(instance, "xrPathToString");
-    if (suggested && to_string && (layer_debug || aim_correction_on()))
+    if (suggested && to_string && (layer_debug || legacy_pose_time || aim_correction_on()))
         for (uint32_t i = 0; i < suggested->countSuggestedBindings; ++i) {
             char path[XR_MAX_PATH_LENGTH];
             uint32_t size = 0;
-            if (XR_SUCCEEDED(to_string(instance, suggested->suggestedBindings[i].binding, sizeof(path), &size, path)))
+            if (XR_SUCCEEDED(to_string(instance, suggested->suggestedBindings[i].binding, sizeof(path), &size, path))) {
                 note_pose_binding(suggested->suggestedBindings[i].action, path);
+                if (legacy_pose_time) legacy_note_binding(suggested->suggestedBindings[i].action, path);
+            }
         }
     XrResult r = fn(instance, suggested);
     input_diag_suggested(instance, suggested, r, to_string);  // the runtime's answer to the game's own suggestion
@@ -355,6 +357,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL hook_xrCreateActionSpace(XrSession session
         if (logged++ < 4) LOG("aim correction: pitch %.1f deg, yaw %.1f deg, forward %.3f m", aim_pitch, aim_yaw, aim_forward);
     }
     XrResult result = fn(session, &fixed, space);
+    if (legacy_pose_time && XR_SUCCEEDED(result) && space) legacy_note_space(info->action, *space);
     if (layer_debug && XR_SUCCEEDED(result) && space && kind >= 0) {
         pthread_mutex_lock(&pose_lock);
         if (pose_space_count < MAX_POSE_ACTIONS) {
@@ -365,8 +368,29 @@ static XRAPI_ATTR XrResult XRAPI_CALL hook_xrCreateActionSpace(XrSession session
         pthread_mutex_unlock(&pose_lock);
         LOG("layer_debug: %s action space %p (subaction %llu)", kind ? "aim" : "grip", (void *)(uintptr_t)*space,
             (unsigned long long)info->subactionPath);
+        const XrPosef *p = &info->poseInActionSpace;
+        LOG("pose_time: create %s subaction=%llu incoming_pos=%.6f,%.6f,%.6f incoming_q=%.6f,%.6f,%.6f,%.6f",
+            kind ? "aim" : "grip", (unsigned long long)info->subactionPath,
+            p->position.x, p->position.y, p->position.z,
+            p->orientation.x, p->orientation.y, p->orientation.z, p->orientation.w);
     }
     return result;
+}
+
+// Sampling only: report each known controller space at most once per second. Never replace the requested time/pose.
+static void debug_pose_time(XrSpace space, XrTime time, XrResult result, const XrSpaceLocation *location) {
+    int64_t now = monotonic_ns();
+    pthread_mutex_lock(&pose_lock);
+    for (int i = 0; i < pose_space_count; ++i) {
+        if (pose_spaces[i].space != space || now - pose_spaces[i].last_log < 1000000000ll) continue;
+        pose_spaces[i].last_log = now;
+        LOG("pose_time: locate %s subaction=%llu requested=%lld predicted=%lld delta_ms=%.3f result=%d flags=0x%llx",
+            pose_spaces[i].aim ? "aim" : "grip", (unsigned long long)pose_spaces[i].subaction,
+            (long long)time, (long long)last_predicted_time, (time - last_predicted_time) / 1e6, result,
+            (unsigned long long)(XR_SUCCEEDED(result) && location ? location->locationFlags : 0));
+        break;
+    }
+    pthread_mutex_unlock(&pose_lock);
 }
 
 // layer_debug: about once a second, the aim pose of each hand expressed in its grip pose.

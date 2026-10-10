@@ -22,6 +22,24 @@ embeds debug paths (`-g`) and the dex depends on the d8 version, so those differ
 | `venc/` | `linux-arm64-bin/fp_venc` | Hardware H.264 encoder for the live view, run on the Frame (spec: `venc/SPEC.md`). Reads SteamVR's "headset view" webcam (v4l2loopback `/dev/video99`, RGB24), box-scales and converts it to NV12 (BT.709 limited range; `convert.c`, NEON with a bit-identical scalar reference, also built for x86_64 by the host test), and feeds the SoC's V4L2 stateful encoder (`dev-encoder.rst`, Qualcomm iris `/dev/video-enc0`): CBR, no B-frames, SPS/PPS on every IDR, one frame per slot of a fixed grid (fps = a divisor of the panel refresh read through DRM KMS, default cap 45), Annex B on stdout. stdin `k` = keyframe, `q`/EOF = drain and stop; `--probe` prints the setup as JSON, `--selftest` compares NEON and scalar output. Fully static and freestanding (raw syscalls, own `_start`; only the NDK's kernel UAPI headers, staged in `.cache/uapi-arm64`), byte-reproducible. Lives in `linux-arm64-bin/` because `linux-arm64/` is uploaded whole as the OpenXR layer. |
 | `java-stubs/` | `dex/oculusos-stubs.dex` | No-op `com.oculus.os.AnalyticsEvent` / `UnifiedTelemetryLogger` for native code that looks them up. |
 
+Legacy Unity's `ovrpshim/` normally waits at the render `Update2` phase. The manual experimental patch
+`frame.unity_early_frame_wait` selects a separate same-length lookup and waits before the first simulation or render
+`Update2` for each frame; replacement OVRPlugin can otherwise update both simulation and render poses before the
+render-phase wait. The opt-in wrapper deduplicates concurrent waits and lets older render updates progress while a
+newer wait blocks. It preserves update arguments/results and the original wrapper's default behavior. Host tests
+exercise the production C source, including the cross-thread `Wait(N+1)` / `Update(render,N)` / `Begin(N)` ordering;
+Until You Fall device tracing removed the render warning but retained the separate physics cache warning and its
+invalid timestamp fallback, so early wait alone is incomplete. Revision 2 installs a versioned adapter/shim bridge
+and the dedicated `legacy_pose_time=1` setting. After a successful wait that actually reached `xrWaitFrame`, it
+captures that frame's predicted time before another wait can start. Only within the same thread's physics update,
+the adapter replaces the literal 100000000 ns view sentinel and known controller requests within that call's
+measured monotonic-clock interval. Valid XR requests and calls outside the scope pass through unchanged. Controller
+space registration works with diagnostics off; destroyed spaces are removed. Bounded `legacy_pose_time:` records
+distinguish actual view/controller corrections. Missing bridge exports disable correction safely. The original
+OVRPlugin warning is not suppressed, and controller feel still requires a worn comparison.
+`layer_debug` also logs controller action-space inputs, requested
+versus predicted locate times, and the runtime/fallback time-conversion route without changing pose or timing policy.
+
 The ovr_* stub library is *not* prebuilt: `src/frameport/analysis/stubgen.py` generates it per game from the exact
 missing symbols (no compiler needed).
 

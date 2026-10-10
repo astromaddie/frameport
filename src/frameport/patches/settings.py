@@ -371,6 +371,8 @@ def adapter_settings(recipe_patches: dict) -> dict:
             elif spec and spec[1] == "int":
                 value = int(value)
             out[key] = value
+    if "frame.unity_early_frame_wait" in recipe_patches:
+        out["legacy_pose_time"] = 1
     return out
 
 

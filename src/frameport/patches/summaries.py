@@ -2,6 +2,9 @@
 technical description (patch.description) is shown with "Show technical details" and in the CLI."""
 
 SUMMARIES = {
+    "frame.unity_legacy_begin_frame": "Starts a missing VR frame before older Unity games submit it.",
+    "frame.unity_early_frame_wait": "Updates controller tracking after waiting for the current frame "
+                                    "in selected older Unity games.",
     # OVRPort (the Quest → OpenXR conversion)
     "patch_copy_libraries": "Adds the parts that let a Quest game talk to the Steam Frame. Needed for every Quest "
                             "game.",

@@ -105,6 +105,7 @@ static int sc_acquires, sc_waits, sc_releases, sc_wait_fails;  // per pacing per
 static int controller_fix = 1;
 static int swapchain_fix = 1;
 static int rect_clamp = 1;
+static int legacy_pose_time;  // manual Unity physics timestamp bridge; off by default
 static int pose_consistency = 0;  // repeat xrLocateViews queries for one display time get the same poses (GitHub #8)  // clamp submitted image rects to their swapchain (SteamVR rejects a 1 px overrun)
 static int layer_fix = 1;
 static int mutable_fix = 0;
@@ -161,6 +162,7 @@ static void read_settings(const char *path) {
         if (sscanf(line, "controller_fix=%f", &value) == 1) controller_fix = value != 0;
         if (sscanf(line, "swapchain_fix=%f", &value) == 1) swapchain_fix = value != 0;
         if (sscanf(line, "rect_clamp=%f", &value) == 1) rect_clamp = value != 0;
+        if (sscanf(line, "legacy_pose_time=%f", &value) == 1) legacy_pose_time = value != 0;
         if (sscanf(line, "pose_consistency=%f", &value) == 1) pose_consistency = value != 0;
         if (sscanf(line, "layer_fix=%f", &value) == 1) layer_fix = value != 0;
         if (sscanf(line, "mutable_fix=%f", &value) == 1) mutable_fix = value != 0;
@@ -756,31 +758,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetSystemProperties(XrInstance instance, XrSyst
 
 #include "flip_vk.c"
 
-// XR_KHR_convert_timespec_time for runtimes that lack it (Frame): XrTime is derived from the monotonic clock
-// using the offset measured at the last xrWaitFrame. The runtime's own implementation is preferred.
-static PFN_xrConvertTimespecTimeToTimeKHR runtime_timespec_to_time;
-static PFN_xrConvertTimeToTimespecTimeKHR runtime_time_to_timespec;
+#include "time_conversion.c"
+#include "legacy_pose_time.c"
 
-static XRAPI_ATTR XrResult XRAPI_CALL emu_timespec_to_time(XrInstance instance, const struct timespec *ts, XrTime *time) {
-    if (runtime_timespec_to_time) {
-        XrResult r = runtime_timespec_to_time(instance, ts, time);
-        if (r != XR_ERROR_FUNCTION_UNSUPPORTED) return r;
-    }
-    if (!ts || !time) return XR_ERROR_VALIDATION_FAILURE;
-    *time = (XrTime)((int64_t)ts->tv_sec * 1000000000ll + ts->tv_nsec + (xr_time_calibrated ? xr_time_offset : 0));
-    return XR_SUCCESS;
-}
-static XRAPI_ATTR XrResult XRAPI_CALL emu_time_to_timespec(XrInstance instance, XrTime time, struct timespec *ts) {
-    if (runtime_time_to_timespec) {
-        XrResult r = runtime_time_to_timespec(instance, time, ts);
-        if (r != XR_ERROR_FUNCTION_UNSUPPORTED) return r;
-    }
-    if (!ts) return XR_ERROR_VALIDATION_FAILURE;
-    int64_t mono = (int64_t)time - (xr_time_calibrated ? xr_time_offset : 0);
-    ts->tv_sec = (time_t)(mono / 1000000000ll);
-    ts->tv_nsec = (long)(mono % 1000000000ll);
-    return XR_SUCCESS;
-}
+static void debug_pose_time(XrSpace space, XrTime time, XrResult result, const XrSpaceLocation *location);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation *location) {
     if (emulate_scene && location) {
@@ -792,7 +773,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(XrSpace space, XrSpace baseSpace, X
         }
     }
     PFN_xrLocateSpace fn = (PFN_xrLocateSpace)lookup(active_instance, "xrLocateSpace");
-    return fn ? fn(space, baseSpace, time, location) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    XrTime fixed_time = legacy_space_time(space, time);
+    XrResult result = fn ? fn(space, baseSpace, fixed_time, location) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (layer_debug) debug_pose_time(space, time, result, location);
+    return result;
 }
 
 static XrResult locate_spaces_common(const char *name, XrSession session, const XrSpacesLocateInfo *info,
@@ -825,7 +809,9 @@ static XRAPI_ATTR XrResult XRAPI_CALL emu_locate_spaces_khr(XrSession session, c
 XRAPI_ATTR XrResult XRAPI_CALL xrDestroySpace(XrSpace space) {
     if (fake_space_index(space) >= 0) return XR_SUCCESS;  // entity spaces live for the whole session
     PFN_xrDestroySpace fn = (PFN_xrDestroySpace)lookup(active_instance, "xrDestroySpace");
-    return fn ? fn(space) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    XrResult result = fn ? fn(space) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (legacy_pose_time && XR_SUCCEEDED(result)) forget_pose_space(space);
+    return result;
 }
 
 #include "input_diag.c"
@@ -1082,12 +1068,21 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitI
     XrResult result = fn(session, info, state);
     if (XR_SUCCEEDED(result) && state) {
         last_predicted_time = state->predictedDisplayTime;
+        legacy_wait_time = state->predictedDisplayTime;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t mono = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
         // predictedDisplayTime is about one display period ahead of "now".
+        int64_t previous_offset = xr_time_offset;
         xr_time_offset = (int64_t)(state->predictedDisplayTime - state->predictedDisplayPeriod) - mono;
         xr_time_calibrated = 1;
+        static int64_t last_time_log;
+        if (layer_debug && mono - last_time_log >= 1000000000ll) {
+            last_time_log = mono;
+            LOG("pose_time: wait predicted=%lld period=%lld mono=%lld estimated_offset=%lld offset_change_ms=%.3f",
+                (long long)state->predictedDisplayTime, (long long)state->predictedDisplayPeriod,
+                (long long)mono, (long long)xr_time_offset, (xr_time_offset - previous_offset) / 1e6);
+        }
         if (layer_debug) debug_aim_vs_grip(state->predictedDisplayTime);
     }
     if (trace)
@@ -1157,6 +1152,12 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateViews(XrSession session, const XrViewLoca
         uint32_t capacity, uint32_t *count, XrView *views) {
     PFN_xrLocateViews fn = (PFN_xrLocateViews)lookup(active_instance, "xrLocateViews");
     if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    XrViewLocateInfo fixed;
+    if (info && legacy_scope.predicted) {
+        fixed = *info;
+        fixed.displayTime = legacy_query_time(info->displayTime, 0);
+        info = &fixed;
+    }
     int cacheable = pose_consistency && info && state && count && views && capacity > 0;
     if (cacheable && pose_cache_lookup(session, info, state, capacity, count, views)) return XR_SUCCESS;
     XrResult result = fn(session, info, state, capacity, count, views);
@@ -1782,9 +1783,9 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance, const 
     }
     if (sync_guard || layer_debug || input_diag) HOOK_AS(xrSyncActions, hook_xrSyncActions)
     if (layer_debug) HOOK_AS(xrGetActionStateBoolean, hook_xrGetActionStateBoolean)
-    if (layer_debug || aim_correction_on() || profile_remap || input_diag)
+    if (layer_debug || legacy_pose_time || aim_correction_on() || profile_remap || input_diag)
         HOOK_AS(xrSuggestInteractionProfileBindings, hook_xrSuggestInteractionProfileBindings)
-    if (layer_debug || aim_correction_on()) {
+    if (layer_debug || legacy_pose_time || aim_correction_on()) {
         HOOK_AS(xrCreateActionSpace, hook_xrCreateActionSpace)
     }
 #undef HOOK_AS

@@ -14,6 +14,8 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdint.h>
+#include "../legacy_pose_time.h"
 #include <stdio.h>
 
 #define TAG "FrameBridge"
@@ -33,8 +35,21 @@ static PFN_BeginFrame real_begin_frame;
 static PFN_EndFrame real_end_frame;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static unsigned int trace_calls;
-enum { TRACE_UPDATE2, TRACE_STAGE_COUNT, TRACE_BEGIN_FRAME, TRACE_END_FRAME, TRACE_API_COUNT };
+enum {
+    TRACE_UPDATE2,
+    TRACE_STAGE_COUNT,
+    TRACE_BEGIN_FRAME,
+    TRACE_END_FRAME,
+    TRACE_CONDITIONAL_END_FRAME,
+    TRACE_API_COUNT
+};
 static unsigned int traced_api_calls[TRACE_API_COUNT];
+
+// The experimental legacy-frame patch only injects BeginFrame when Unity has not forwarded a matching frame on this
+// render thread since the preceding EndFrame. Unity's legacy render calls are serialized on that thread.
+static __thread int unity_begin_pending;
+static __thread int unity_begin_frame;
+static __thread int unity_begin_result;
 
 typedef struct {
     unsigned int call;
@@ -79,27 +94,86 @@ static void trace_exit(ApiTrace trace, const char *api, int result) {
 
 static void mouse_click_frame(void);  // below: controller presses as Unity mouse clicks
 
-EXPORT int fpov_Update2(int step, int frame_index, double prediction_seconds) {
+static FrameportPoseWaitReset pose_wait_reset;
+static FrameportPoseWaitTime pose_wait_time;
+static FrameportPosePush pose_push;
+static FrameportPosePop pose_pop;
+static pthread_once_t pose_once = PTHREAD_ONCE_INIT;
+static void pose_init(void) {
+    void *adapter = dlopen("libopenxr_loader_generic.so", RTLD_NOW | RTLD_NOLOAD);
+    if (adapter) {
+        pose_wait_reset = (FrameportPoseWaitReset)dlsym(adapter, "framebridge_pose_wait_reset_v1");
+        pose_wait_time = (FrameportPoseWaitTime)dlsym(adapter, "framebridge_pose_wait_time_v1");
+        pose_push = (FrameportPosePush)dlsym(adapter, "framebridge_pose_push_v1");
+        pose_pop = (FrameportPosePop)dlsym(adapter, "framebridge_pose_pop_v1");
+    }
+    if (!pose_wait_reset || !pose_wait_time || !pose_push || !pose_pop) {
+        pose_wait_reset = NULL; pose_wait_time = NULL; pose_push = NULL; pose_pop = NULL;
+        LOG("legacy_pose_time: optional adapter ABI unavailable; scoped pose correction disabled");
+    }
+}
+
+static int update2(int step, int frame_index, double prediction_seconds, int early_wait) {
     pthread_once(&once, init);
-    static int last_waited = -1, logged;
+    // Reserve an early wait across callers, but never hold the mutex in a runtime call: Wait(N+1) may
+    // depend on another thread's Update(render,N) -> Begin(N). Older render updates must remain runnable.
+    static pthread_mutex_t early_lock = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t early_done = PTHREAD_COND_INITIALIZER;
+    static int early_waiting, early_pending = -1, early_last_waited = -1;
+    static int64_t early_last_time;
+    int64_t owned_time = 0;
+    if (early_wait) pthread_once(&pose_once, pose_init);
+    static int legacy_last_waited = -1, logged_by_mode[2];
     int render_step = step == STEP_RENDER;
+    int wait_phase = render_step || (early_wait && step == 0);
+    int last_waited, pending_newer = 0;
+    if (early_wait) {
+        pthread_mutex_lock(&early_lock);
+        while (wait_phase && early_waiting && frame_index >= early_pending)
+            pthread_cond_wait(&early_done, &early_lock);
+        last_waited = early_last_waited;
+        if (frame_index == early_last_waited) owned_time = early_last_time;
+        pending_newer = early_waiting && frame_index < early_pending;
+    } else last_waited = legacy_last_waited;
     int last_waited_before = last_waited;
-    int dedup = render_step && frame_index == last_waited_before;
+    int dedup = wait_phase && (early_wait ? frame_index <= last_waited || pending_newer : frame_index == last_waited);
     int wait_available = real_wait != NULL;
-    int wait_called = render_step && wait_available && !dedup;
+    int wait_called = wait_phase && wait_available && !dedup;
+    if (early_wait) {
+        if (wait_called) { early_pending = frame_index; early_waiting = 1; }
+        pthread_mutex_unlock(&early_lock);
+    }
     char arguments[192];
     snprintf(arguments, sizeof(arguments), "step=%d frame=%d prediction=%.6f render=%d wait_phase=%d last_waited=%d "
              "dedup=%d wait_available=%d wait_called=%d", step, frame_index, prediction_seconds, render_step,
-             render_step, last_waited_before, dedup, wait_available, wait_called);
+             wait_phase, last_waited_before, dedup, wait_available, wait_called);
     ApiTrace trace = trace_enter(TRACE_UPDATE2, "Update2", arguments);
     int wait_result = 0;
     if (wait_called) {
-        last_waited = frame_index;
+        if (!early_wait) legacy_last_waited = frame_index;  // preserve the original wrapper's reentry behavior
+        if (early_wait && pose_wait_reset) pose_wait_reset();
         wait_result = real_wait(frame_index);
-        if (logged++ < 3) LOG("ovrp frame loop shim: waited for frame %d: %d", frame_index, wait_result);
+        if (early_wait && pose_wait_time && wait_result >= 0) owned_time = pose_wait_time();
+        if (!early_wait || wait_result >= 0) last_waited = frame_index;
+        if (early_wait) {
+            pthread_mutex_lock(&early_lock);
+            early_last_waited = last_waited;
+            if (wait_result >= 0) early_last_time = owned_time;
+            early_waiting = 0;
+            pthread_cond_broadcast(&early_done);
+            pthread_mutex_unlock(&early_lock);
+        }
+        int logged = __atomic_fetch_add(&logged_by_mode[early_wait], 1, __ATOMIC_RELAXED);
+        if (logged < 3) LOG("ovrp frame loop shim: waited for frame %d: %d", frame_index, wait_result);
+        if (early_wait && logged < 3)
+            LOG("ovrp early wait: step=%d frame=%d result=%d", step, frame_index, wait_result);
         mouse_click_frame();
     }
+    FrameportPoseScope saved_scope;
+    int scoped = early_wait && step == 0 && owned_time > 0 && pose_push;
+    if (scoped) pose_push(owned_time, &saved_scope);
     int update_result = real_update2 ? real_update2(step, frame_index, prediction_seconds) : -1000;  // ovrpFailure
+    if (scoped) pose_pop(&saved_scope);
     if (trace.enabled) {
         if (wait_called)
             LOG("ovrp api trace: exit call=%u api_call=%u api=Update2 last_waited=%d wait_called=1 wait_result=%d updateresult=%d",
@@ -109,6 +183,18 @@ EXPORT int fpov_Update2(int step, int frame_index, double prediction_seconds) {
                 trace.call, trace.api_call, last_waited_before, update_result);
     }
     return update_result;
+}
+
+EXPORT int fpov_Update2(int step, int frame_index, double prediction_seconds) {
+    return update2(step, frame_index, prediction_seconds, 0);
+}
+
+// Manual frame.unity_early_frame_wait: Unity's simulation Update2(0,N) implicitly updates render poses too in
+// replacement OVRPlugin. Waiting only at Update2(-1,N) leaves both earlier updates outside frame N's bounds.
+EXPORT int fpow_PoseTimeVersion(void) { return 1; }
+
+EXPORT int fpow_Update2(int step, int frame_index, double prediction_seconds) {
+    return update2(step, frame_index, prediction_seconds, 1);
 }
 
 EXPORT int fpov_GetEyeTextureStageCount(void) {
@@ -125,6 +211,11 @@ EXPORT int fpov_BeginFrame(int frame_index) {
     ApiTrace trace = trace_enter(TRACE_BEGIN_FRAME, "BeginFrame", arguments);
     pthread_once(&once, init);
     int result = real_begin_frame ? real_begin_frame(frame_index) : -1000;
+    if (real_begin_frame) {
+        unity_begin_frame = frame_index;
+        unity_begin_result = result;
+        unity_begin_pending = 1;
+    }
     trace_exit(trace, "BeginFrame", result);
     return result;
 }
@@ -137,6 +228,31 @@ EXPORT int fpov_EndFrame(int frame_index) {
     int result = real_end_frame ? real_end_frame(frame_index) : -1000;
     trace_exit(trace, "EndFrame", result);
     return result;
+}
+
+// Opt-in compatibility entry point. Unity's direct BeginFrame lookup is redirected to fpov_BeginFrame so this
+// wrapper can observe the real call. If that matching call is absent on this render thread, begin a real frame just
+// before the original EndFrame. Both real return values remain unchanged; no waits or layers are synthesized.
+EXPORT int fpob_EndFrame(int frame_index) {
+    int unity_began = unity_begin_pending && unity_begin_frame == frame_index;
+    unity_begin_pending = 0;  // do not let an unmatched earlier frame satisfy a later EndFrame
+    unsigned long long thread = (unsigned long long)(uintptr_t)pthread_self();
+    char arguments[96];
+    snprintf(arguments, sizeof(arguments), "frame=%d begin_source=%s thread=%llu", frame_index,
+             unity_began ? "unity" : "shim", thread);
+    ApiTrace trace = trace_enter(TRACE_CONDITIONAL_END_FRAME, "ConditionalEndFrame", arguments);
+    pthread_once(&once, init);
+
+    int begin_called = !unity_began && real_begin_frame != NULL;
+    int begin_result = unity_began ? unity_begin_result : -1000;
+    if (begin_called) begin_result = real_begin_frame(frame_index);
+    int end_result = real_end_frame ? real_end_frame(frame_index) : -1000;
+    if (trace.enabled)
+        LOG("ovrp conditional end-begin: call=%u frame=%d thread=%llu begin_source=%s begin_called=%d "
+            "begin_result=%d end_result=%d", trace.api_call, frame_index, thread,
+            unity_began ? "unity" : "shim", begin_called, begin_result, end_result);
+    trace_exit(trace, "ConditionalEndFrame", end_result);
+    return end_result;
 }
 
 // ---------------------------------------------------------------- input diagnostics (pass-through)

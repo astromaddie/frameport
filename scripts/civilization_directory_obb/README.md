@@ -5,10 +5,9 @@ the reviewed `frameport.civ` helper DEX and changes the single native MAIN activ
 helper serves only validated, pre-extracted OBB directories. It falls back to Android's original OBB service whenever
 the source image, key, location, or ready marker does not match.
 
-In the current device run, the lowercase `base.obb` alias allowed all eleven requested OBB mounts, including the
-uppercase `Base.obb` image, and the earlier `PLY_Projector` missing-lookup crash did not recur. The run continued
-with balanced VR frame submission beyond 90 seconds. The off-head compositor capture was dark, so headset visuals
-and gameplay remain unverified.
+The lowercase `base.obb` alias allowed all eleven requested OBB mounts and removed the earlier `PLY_Projector`
+missing-lookup crash; the wearer has now confirmed that menus and gameplay work. Controller pointing/jitter and
+reported exit behavior remain under investigation.
 
 The packager requires explicit JDK and Android SDK paths. Use JDK 17, Android API 31 (API 26 or newer is accepted),
 and the matching Android build-tools `d8`. It does not download or bundle tools. From a FramePort source checkout:
