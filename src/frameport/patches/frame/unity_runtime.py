@@ -72,18 +72,21 @@ class UnityMultiPass(Il2cppReturnPatch):
 
 class UnityNoOverlayCopy(Il2cppReturnPatch):
     id = "frame.unity_no_overlay_copy"
-    title = "Unity: skip OVROverlay layers (fades, splash screens)"
+    title = "Unity: skip failing compositor layers (fades, splash screens)"
     description = ("Meta's OVROverlay copies a texture into its own compositor layer every frame. On the Frame, "
                    "Unity may request a tiny six-face XR swapchain that the runtime rejects (result -2), then crash "
                    "with a null dereference while initializing the overlay. This is separate from texture-copy "
                    "crashes inside the GL driver (e.g. The Room VR). Rewrites OVROverlay.CreateLayer and PopulateLayer "
-                   "-> false in libil2cpp.so (found with Cpp2IL), preventing both paths; fades become instant cuts, "
-                   "overlay splash screens and menus disappear. Only for games with these failures.")
+                   "plus SG.XR.Oculus.XRPlatformOculus.SetUnderlayColor to return early in libil2cpp.so (found with "
+                   "Cpp2IL), preventing both paths; fades become instant cuts, solid-color underlays and overlay "
+                   "splash screens/menus disappear. Only for games with these failures.")
     order = 49
     targets = {"Oculus.VR/OVROverlay.cs": {"CreateLayer": RET_ZERO, "PopulateLayer": RET_ZERO},
                "Assembly-CSharp/OVROverlay.cs": {"CreateLayer": RET_ZERO,
-                                                 "PopulateLayer": RET_ZERO}}  # older Oculus Integration
-    revision = 2  # skip the failing XR swapchain allocation before suppressing per-frame overlay copies
+                                                 "PopulateLayer": RET_ZERO},  # older Oculus Integration
+               # Until You Fall creates a 1x1 cubemap underlay through its own XR-layer path.
+               "SG.XR.Oculus/SG/XR/XRPlatformOculus.cs": {"SetUnderlayColor": RET_ZERO}}
+    revision = 3  # also suppress Until You Fall's custom 1x1 cubemap-underlay allocation
     check_name = "Unity overlays"
 
     def applies(self, a):

@@ -16,7 +16,7 @@ def _lib() -> bytes:
 
 def test_all_il2cpp_patches_share_one_cpp2il_lookup():
     base.load_all()
-    for p in (U.UnityTextInput, R.UnityRuntimeMsaa, R.UnityMultiPass):
+    for p in (U.UnityTextInput, R.UnityRuntimeMsaa, R.UnityMultiPass, R.UnityNoOverlayCopy):
         for cls, methods in p.targets.items():
             assert set(methods) <= set(U.ALL_TARGETS[cls])
     # keyed by the build's metadata: an earlier patch's bytes in libil2cpp.so don't force another Cpp2IL run
@@ -52,19 +52,26 @@ def test_runtime_msaa_suggested_for_gles_ovr_games_only():
 def test_overlay_patch_skips_swapchain_creation_before_layer_population():
     lib = _lib()
     lo, _hi = U._executable(lib)[0]
-    create, populate = (lo + 0x40) & ~3, (lo + 0x80) & ~3
-    targets = R.UnityNoOverlayCopy.targets["Oculus.VR/OVROverlay.cs"]
+    create, populate, underlay = ((lo + x) & ~3 for x in (0x40, 0x80, 0xC0))
+    targets = {**R.UnityNoOverlayCopy.targets}
     found = {"Oculus.VR/OVROverlay.cs": {
-        "CreateLayer": (create, 0x100), "PopulateLayer": (populate, 0x100)}}
+        "CreateLayer": (create, 0x100), "PopulateLayer": (populate, 0x100)},
+             "SG.XR.Oculus/SG/XR/XRPlatformOculus.cs": {"SetUnderlayColor": (underlay, 0x100)}}
 
-    patched, notes = U.patch_methods(lib, found, {"Oculus.VR/OVROverlay.cs": targets})
+    patched, notes = U.patch_methods(lib, found, targets)
 
     assert patched is not None
     assert patched[create:create + 8] == R.RET_ZERO
     assert patched[populate:populate + 8] == R.RET_ZERO
+    assert patched[underlay:underlay + 8] == R.RET_ZERO
     assert patched[create + 8:create + 12] == lib[create + 8:create + 12]
+    assert patched[underlay + 8:underlay + 12] == lib[underlay + 8:underlay + 12]
+    allowed = (set(range(create, create + 8)) | set(range(populate, populate + 8)) |
+               set(range(underlay, underlay + 8)))
+    assert all(before == after or i in allowed for i, (before, after) in enumerate(zip(lib, patched)))
     assert any("CreateLayer" in note for note in notes)
     assert any("PopulateLayer" in note for note in notes)
+    assert any("SetUnderlayColor" in note for note in notes)
 
 
 def test_cube_overlay_swapchain_failure_suggests_overlay_patch():
