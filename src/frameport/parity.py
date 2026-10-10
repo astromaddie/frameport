@@ -26,7 +26,8 @@ from .recommend import catalog, engine
 from .sources import quest_dump
 
 OWNED = {"libopenxr_loader_generic.so": "FrameBridge adapter", "libvrapi.so": "VrApi bridge", "libglshim.so": "GL shim",
-         "libovrplatformcompat.so": "platform compat", "libfp_vk.so": "Vulkan shim"}
+         "libovrplatformcompat.so": "platform compat", "libfp_vk.so": "Vulkan shim",
+         "libfp_ovrp.so": "legacy Unity OVRPlugin shim"}
 
 
 def _default_rewrites(base: str, old: bytes) -> list[tuple[bytes, str]]:

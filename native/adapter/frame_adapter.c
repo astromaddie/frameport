@@ -91,6 +91,7 @@ static int foveation_fix = 1;
 static int hide_space_warp = 0;
 static int strip_color_bias = 0;
 static int snapshot = 0;  // seconds between eye-image snapshots (snapshot_gl.c; 0 = off)
+static int snapshot_quad = 0;  // opt-in capture of the first submitted GLES quad instead of the projection eye
 static char snap_dir[256];
 static void snap_on_create(XrSwapchain handle, const XrSwapchainCreateInfo *info);
 static void snap_on_destroy(XrSwapchain handle);
@@ -156,6 +157,7 @@ static void read_settings(const char *path) {
         if (sscanf(line, "strip_color_bias=%f", &value) == 1) strip_color_bias = (int)value;
         if (sscanf(line, "frame_balance=%f", &value) == 1) frame_balance = value != 0;
         if (sscanf(line, "snapshot=%f", &value) == 1) snapshot = value > 0 ? (int)value : 0;
+        if (sscanf(line, "snapshot_quad=%f", &value) == 1) snapshot_quad = value != 0;
         if (sscanf(line, "controller_fix=%f", &value) == 1) controller_fix = value != 0;
         if (sscanf(line, "swapchain_fix=%f", &value) == 1) swapchain_fix = value != 0;
         if (sscanf(line, "rect_clamp=%f", &value) == 1) rect_clamp = value != 0;
@@ -233,7 +235,7 @@ static void initialize(void) {
     if (env && *env) read_settings(env);
     if (snapshot && *process && !strchr(process, '/')) {
         snprintf(snap_dir, sizeof(snap_dir), "/sdcard/Android/data/%s/files", process);
-        LOG("per-game: snapshot every %d s to %s/fb_snap_N.ppm", snapshot, snap_dir);
+        LOG("per-game: snapshot every %d s to %s/%s_N.ppm", snapshot, snap_dir, snapshot_quad ? "fb_quad" : "fb_snap");
     }
     if (eye_debug && *process && !strchr(process, '/')) {
         snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/framebridge.log", process);
@@ -1068,8 +1070,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateReferenceSpace(XrSession session, const X
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitInfo *info, XrFrameState *state) {
+    static unsigned int trace_calls;
+    unsigned int trace_call = layer_debug ? __atomic_add_fetch(&trace_calls, 1, __ATOMIC_RELAXED) : 0;
+    int trace = trace_call > 0 && trace_call <= 16;
+    if (trace) LOG("frame_trace: xrWaitFrame enter call=%u session=%p", trace_call, (void *)(uintptr_t)session);
     PFN_xrWaitFrame fn = (PFN_xrWaitFrame)lookup(active_instance, "xrWaitFrame");
-    if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!fn) {
+        if (trace) LOG("frame_trace: xrWaitFrame exit call=%u result=%d", trace_call, XR_ERROR_FUNCTION_UNSUPPORTED);
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
     XrResult result = fn(session, info, state);
     if (XR_SUCCEEDED(result) && state) {
         last_predicted_time = state->predictedDisplayTime;
@@ -1081,6 +1090,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitI
         xr_time_calibrated = 1;
         if (layer_debug) debug_aim_vs_grip(state->predictedDisplayTime);
     }
+    if (trace)
+        LOG("frame_trace: xrWaitFrame exit call=%u result=%d predicted=%lld period=%lld shouldRender=%u", trace_call, result,
+            (long long)(XR_SUCCEEDED(result) && state ? state->predictedDisplayTime : 0),
+            (long long)(XR_SUCCEEDED(result) && state ? state->predictedDisplayPeriod : 0),
+            XR_SUCCEEDED(result) && state ? state->shouldRender : 0);
     return result;
 }
 
@@ -1195,8 +1209,18 @@ XRAPI_ATTR XrResult XRAPI_CALL xrLocateViews(XrSession session, const XrViewLoca
 // with no layers, as the runtime expects.
 static XrTime last_begin_display_time;
 XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession session, const XrFrameBeginInfo *info) {
+    static unsigned int trace_calls;
+    unsigned int trace_call = layer_debug ? __atomic_add_fetch(&trace_calls, 1, __ATOMIC_RELAXED) : 0;
+    int trace = trace_call > 0 && trace_call <= 16;
+    if (trace)
+        LOG("frame_trace: xrBeginFrame enter call=%u session=%p predicted=%lld open=%d", trace_call,
+            (void *)(uintptr_t)session, (long long)last_predicted_time, frame_open);
     PFN_xrBeginFrame fn = (PFN_xrBeginFrame)lookup(active_instance, "xrBeginFrame");
-    if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!fn) {
+        if (trace) LOG("frame_trace: xrBeginFrame exit call=%u result=%d open=%d", trace_call,
+                       XR_ERROR_FUNCTION_UNSUPPORTED, frame_open);
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
     if (frame_open && frame_balance) {
         PFN_xrEndFrame end = (PFN_xrEndFrame)lookup(active_instance, "xrEndFrame");
         XrFrameEndInfo empty = {XR_TYPE_FRAME_END_INFO, NULL, last_begin_display_time ? last_begin_display_time
@@ -1214,12 +1238,22 @@ XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession session, const XrFrameBegi
         frame_open = 1;
         last_begin_display_time = last_predicted_time;
     }
+    if (trace) LOG("frame_trace: xrBeginFrame exit call=%u result=%d open=%d", trace_call, result, frame_open);
     return result;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
+    static unsigned int trace_calls;
+    unsigned int trace_call = layer_debug ? __atomic_add_fetch(&trace_calls, 1, __ATOMIC_RELAXED) : 0;
+    int trace = trace_call > 0 && trace_call <= 16;
+    if (trace)
+        LOG("frame_trace: xrEndFrame enter call=%u session=%p display=%lld layers=%u", trace_call,
+            (void *)(uintptr_t)session, (long long)(info ? info->displayTime : 0), info ? info->layerCount : 0);
     PFN_xrEndFrame fn = (PFN_xrEndFrame)lookup(active_instance, "xrEndFrame");
-    if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!fn) {
+        if (trace) LOG("frame_trace: xrEndFrame exit call=%u result=%d", trace_call, XR_ERROR_FUNCTION_UNSUPPORTED);
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
     frame_open = 0;
     __atomic_add_fetch(&frame_ends, 1, __ATOMIC_RELAXED);
     snap_end_frame(info);
@@ -1261,8 +1295,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession session, const XrFrameEndInf
         }
     }
     if ((!layer_fix && !swap_eyes && !emulate_passthrough && !flip_quads && !flip_emul && !strip_depth) || !info || !info->layerCount ||
-        info->layerCount > 64)
-        return fn(session, info);
+        info->layerCount > 64) {
+        XrResult result = fn(session, info);
+        if (trace) LOG("frame_trace: xrEndFrame exit call=%u result=%d", trace_call, result);
+        return result;
+    }
     if (layer_debug) {  // the submitted layer list (order, flags, eyes, chained structs) whenever its shape changes
         static char last[1024];
         char now[1024];
@@ -1555,6 +1592,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession session, const XrFrameEndInf
         }
     }
     XrResult result = fn(session, (dropped || swapped || passthrough) ? &fixed : info);
+    if (trace) LOG("frame_trace: xrEndFrame exit call=%u result=%d", trace_call, result);
     if (result == XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED && passthrough && !alpha_blend_failed) {
         alpha_blend_failed = 1;  // runtime refuses camera blending: resubmit as a normal opaque frame
         LOG("xrEndFrame: ALPHA_BLEND unsupported, passthrough falls back to opaque");

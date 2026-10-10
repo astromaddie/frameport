@@ -2,8 +2,9 @@
 // Every <seconds>, at xrEndFrame, the left-eye image the game just submitted (projection layer, view 0: its swapchain
 // image and array layer) is read back on the game's own GL context and written at a quarter of its size as
 // /sdcard/Android/data/<package>/files/fb_snap_<n>.ppm (n = 0-7, the oldest is overwritten). Nobody wears the headset
-// in a launch test, so the headset view stays black: this shows what the game itself draws (e.g. which screen it is
-// stuck on). The game's framebuffer, pack-buffer and pack-alignment bindings are restored afterwards.
+// in an unattended test: these captures show submitted swapchain contents; a black image alone does not establish
+// a stall, especially when xrWaitFrame reports shouldRender=false. snapshot_quad=1 selects the first submitted quad instead, at full size, as fb_quad_<n>.ppm; it does
+// not capture the compositor's final headset view. GL framebuffer, pack-buffer and pack-alignment bindings are restored.
 #define SNAP_MAX_SWAPCHAINS 16
 #define SNAP_MAX_IMAGES 8
 #define SNAP_SCALE 4
@@ -90,16 +91,17 @@ static void snap_on_acquire(XrSwapchain handle, uint32_t index) {
 
 static void snap_write(const unsigned char *rgba, uint32_t w, uint32_t h, int n) {
     char path[320];
-    snprintf(path, sizeof(path), "%s/fb_snap_%d.ppm", snap_dir, n);
+    snprintf(path, sizeof(path), "%s/%s_%d.ppm", snap_dir, snapshot_quad ? "fb_quad" : "fb_snap", n);
     FILE *f = fopen(path, "wb");
     if (!f) { LOG("snapshot: can't write %s", path); return; }
-    uint32_t ow = w / SNAP_SCALE, oh = h / SNAP_SCALE;
+    uint32_t scale = snapshot_quad ? 1 : SNAP_SCALE;
+    uint32_t ow = w / scale, oh = h / scale;
     fprintf(f, "P6\n%u %u\n255\n", ow, oh);
     unsigned char *row = malloc((size_t)ow * 3);
     for (uint32_t y = 0; row && y < oh; ++y) {
-        const unsigned char *src = rgba + (size_t)(h - 1 - y * SNAP_SCALE) * w * 4;  // GL rows are bottom-up
+        const unsigned char *src = rgba + (size_t)(h - 1 - y * scale) * w * 4;  // GL rows are bottom-up
         for (uint32_t x = 0; x < ow; ++x) {
-            const unsigned char *p = src + (size_t)x * SNAP_SCALE * 4;
+            const unsigned char *p = src + (size_t)x * scale * 4;
             row[x * 3] = p[0], row[x * 3 + 1] = p[1], row[x * 3 + 2] = p[2];
         }
         fwrite(row, 1, (size_t)ow * 3, f);
@@ -118,18 +120,21 @@ static void snap_end_frame(const XrFrameEndInfo *info) {
     int64_t t = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
     if (t < next_ns) return;
     next_ns = t + (int64_t)snapshot * 1000000000ll;
-    const XrCompositionLayerProjection *proj = NULL;
-    for (uint32_t i = 0; i < info->layerCount && !proj; ++i)
-        if (info->layers[i] && info->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION &&
+    const XrSwapchainSubImage *sub = NULL;
+    for (uint32_t i = 0; i < info->layerCount && !sub; ++i) {
+        if (!info->layers[i]) continue;
+        if (snapshot_quad && info->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_QUAD)
+            sub = &((const XrCompositionLayerQuad *)info->layers[i])->subImage;
+        if (!snapshot_quad && info->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION &&
             ((const XrCompositionLayerProjection *)info->layers[i])->viewCount)
-            proj = (const XrCompositionLayerProjection *)info->layers[i];
-    if (!proj || !snap_load_gl()) return;
+            sub = &((const XrCompositionLayerProjection *)info->layers[i])->views[0].subImage;
+    }
+    if (!sub || !snap_load_gl()) return;
     if (!s_eglGetCurrentContext()) {
         static int logged;
         if (!logged++) LOG("snapshot: no GL context current in xrEndFrame, no snapshot");
         return;
     }
-    const XrSwapchainSubImage *sub = &proj->views[0].subImage;
     pthread_mutex_lock(&snap_lock);
     int i = snap_find(sub->swapchain, 0);
     GLuint tex = 0;

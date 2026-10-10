@@ -27,6 +27,19 @@ def test_settings_classification():
     assert kind == "equivalent"
 
 
+def test_ovrplugin_shim_update_requires_exact_current_artifact(tmp_path, monkeypatch):
+    from frameport import parity
+
+    abi = tmp_path / "arm64-v8a"
+    abi.mkdir()
+    artifact = abi / "libfp_ovrp.so"
+    artifact.write_bytes(b"current shim build")
+    monkeypatch.setattr(parity, "artifacts_dir", lambda: tmp_path)
+    name = "lib/arm64-v8a/libfp_ovrp.so"
+    assert parity.classify(name, artifact.read_bytes(), b"previous build")[0] == "expected"
+    assert parity.classify(name, b"unverified shim build", b"previous build")[0] == "UNEXPLAINED"
+
+
 def test_report_counts():
     text = render()
     from frameport.recommend import catalog

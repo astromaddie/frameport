@@ -7,12 +7,14 @@
 // "CompositorOpenXR::Update called for frame N outside of frame bounds" thousands of times a second and the Frame's
 // dashboard freezes (Accounting+, Unity 2017.4).
 //
-// FramePort renames the "ovrp_Update2" lookup in libunity.so to "fpov_Update2" (same length) and adds this library to
-// libOVRPlugin.so's DT_NEEDED, so Unity's dlsym on the plugin finds this function: it waits for the frame first (once
-// per frame index, render step only), then calls the real ovrp_Update2.
+// FramePort renames selected OVRPlugin lookup names in libunity.so to their same-length fpov_ wrappers and adds this
+// library to libOVRPlugin.so's DT_NEEDED, so Unity's dlsym on the plugin finds the wrappers. Update2 paces the legacy
+// render step once per frame index; the remaining wrappers are exact pass-throughs used to trace which frame APIs
+// Unity calls and what OVRPlugin returns.
 #include <android/log.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdio.h>
 
 #define TAG "FrameBridge"
 #define EXPORT __attribute__((visibility("default")))
@@ -20,10 +22,25 @@
 
 typedef int (*PFN_Update2)(int step, int frame_index, double prediction_seconds);
 typedef int (*PFN_WaitToBeginFrame)(int frame_index);
+typedef int (*PFN_GetEyeTextureStageCount)(void);
+typedef int (*PFN_BeginFrame)(int frame_index);
+typedef int (*PFN_EndFrame)(int frame_index);
 
 static PFN_Update2 real_update2;
 static PFN_WaitToBeginFrame real_wait;
+static PFN_GetEyeTextureStageCount real_get_eye_texture_stage_count;
+static PFN_BeginFrame real_begin_frame;
+static PFN_EndFrame real_end_frame;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
+static unsigned int trace_calls;
+enum { TRACE_UPDATE2, TRACE_STAGE_COUNT, TRACE_BEGIN_FRAME, TRACE_END_FRAME, TRACE_API_COUNT };
+static unsigned int traced_api_calls[TRACE_API_COUNT];
+
+typedef struct {
+    unsigned int call;
+    unsigned int api_call;
+    int enabled;
+} ApiTrace;
 
 static void init(void) {
     void *ovrp = dlopen("libOVRPlugin.so", RTLD_NOW | RTLD_NOLOAD);
@@ -31,25 +48,95 @@ static void init(void) {
     if (ovrp) {
         real_update2 = (PFN_Update2)dlsym(ovrp, "ovrp_Update2");
         real_wait = (PFN_WaitToBeginFrame)dlsym(ovrp, "ovrp_WaitToBeginFrame");
+        real_get_eye_texture_stage_count =
+            (PFN_GetEyeTextureStageCount)dlsym(ovrp, "ovrp_GetEyeTextureStageCount");
+        real_begin_frame = (PFN_BeginFrame)dlsym(ovrp, "ovrp_BeginFrame");
+        real_end_frame = (PFN_EndFrame)dlsym(ovrp, "ovrp_EndFrame");
     }
-    LOG("ovrp frame loop shim: ovrp_Update2 %s, ovrp_WaitToBeginFrame %s", real_update2 ? "OK" : "MISSING",
-        real_wait ? "OK" : "MISSING");
+    LOG("ovrp trace shim: Update2 %s, WaitToBeginFrame %s, GetEyeTextureStageCount %s, BeginFrame %s, EndFrame %s",
+        real_update2 ? "OK" : "MISSING", real_wait ? "OK" : "MISSING",
+        real_get_eye_texture_stage_count ? "OK" : "MISSING", real_begin_frame ? "OK" : "MISSING",
+        real_end_frame ? "OK" : "MISSING");
 }
 
 #define STEP_RENDER (-1)  // ovrpStep_Render
+
+static ApiTrace trace_enter(int api_id, const char *api, const char *arguments) {
+    ApiTrace trace;
+    trace.call = __atomic_fetch_add(&trace_calls, 1, __ATOMIC_RELAXED) + 1;
+    trace.api_call = __atomic_fetch_add(&traced_api_calls[api_id], 1, __ATOMIC_RELAXED) + 1;
+    trace.enabled = trace.api_call <= 16;
+    if (trace.enabled)
+        LOG("ovrp api trace: enter call=%u api_call=%u api=%s %s result=pending", trace.call, trace.api_call,
+            api, arguments);
+    return trace;
+}
+
+static void trace_exit(ApiTrace trace, const char *api, int result) {
+    if (trace.enabled)
+        LOG("ovrp api trace: exit call=%u api_call=%u api=%s result=%d", trace.call, trace.api_call, api, result);
+}
 
 static void mouse_click_frame(void);  // below: controller presses as Unity mouse clicks
 
 EXPORT int fpov_Update2(int step, int frame_index, double prediction_seconds) {
     pthread_once(&once, init);
     static int last_waited = -1, logged;
-    if (step == STEP_RENDER && real_wait && frame_index != last_waited) {
+    int render_step = step == STEP_RENDER;
+    int last_waited_before = last_waited;
+    int dedup = render_step && frame_index == last_waited_before;
+    int wait_available = real_wait != NULL;
+    int wait_called = render_step && wait_available && !dedup;
+    char arguments[192];
+    snprintf(arguments, sizeof(arguments), "step=%d frame=%d prediction=%.6f render=%d wait_phase=%d last_waited=%d "
+             "dedup=%d wait_available=%d wait_called=%d", step, frame_index, prediction_seconds, render_step,
+             render_step, last_waited_before, dedup, wait_available, wait_called);
+    ApiTrace trace = trace_enter(TRACE_UPDATE2, "Update2", arguments);
+    int wait_result = 0;
+    if (wait_called) {
         last_waited = frame_index;
-        int r = real_wait(frame_index);
-        if (logged++ < 3) LOG("ovrp frame loop shim: waited for frame %d: %d", frame_index, r);
+        wait_result = real_wait(frame_index);
+        if (logged++ < 3) LOG("ovrp frame loop shim: waited for frame %d: %d", frame_index, wait_result);
         mouse_click_frame();
     }
-    return real_update2 ? real_update2(step, frame_index, prediction_seconds) : -1000;  // ovrpFailure
+    int update_result = real_update2 ? real_update2(step, frame_index, prediction_seconds) : -1000;  // ovrpFailure
+    if (trace.enabled) {
+        if (wait_called)
+            LOG("ovrp api trace: exit call=%u api_call=%u api=Update2 last_waited=%d wait_called=1 wait_result=%d updateresult=%d",
+                trace.call, trace.api_call, last_waited, wait_result, update_result);
+        else
+            LOG("ovrp api trace: exit call=%u api_call=%u api=Update2 last_waited=%d wait_called=0 wait_result=not-called updateresult=%d",
+                trace.call, trace.api_call, last_waited_before, update_result);
+    }
+    return update_result;
+}
+
+EXPORT int fpov_GetEyeTextureStageCount(void) {
+    ApiTrace trace = trace_enter(TRACE_STAGE_COUNT, "GetEyeTextureStageCount", "args=none");
+    pthread_once(&once, init);
+    int result = real_get_eye_texture_stage_count ? real_get_eye_texture_stage_count() : -1000;
+    trace_exit(trace, "GetEyeTextureStageCount", result);
+    return result;
+}
+
+EXPORT int fpov_BeginFrame(int frame_index) {
+    char arguments[48];
+    snprintf(arguments, sizeof(arguments), "frame=%d", frame_index);
+    ApiTrace trace = trace_enter(TRACE_BEGIN_FRAME, "BeginFrame", arguments);
+    pthread_once(&once, init);
+    int result = real_begin_frame ? real_begin_frame(frame_index) : -1000;
+    trace_exit(trace, "BeginFrame", result);
+    return result;
+}
+
+EXPORT int fpov_EndFrame(int frame_index) {
+    char arguments[48];
+    snprintf(arguments, sizeof(arguments), "frame=%d", frame_index);
+    ApiTrace trace = trace_enter(TRACE_END_FRAME, "EndFrame", arguments);
+    pthread_once(&once, init);
+    int result = real_end_frame ? real_end_frame(frame_index) : -1000;
+    trace_exit(trace, "EndFrame", result);
+    return result;
 }
 
 // ---------------------------------------------------------------- input diagnostics (pass-through)
