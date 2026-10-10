@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import struct
@@ -12,6 +13,7 @@ import tempfile
 
 SUFFIX = ".frameport-extracted"
 MARKER = ".frameport-obb-ready"
+ALIAS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.obb$")
 
 def metadata(source):
     before = source.stat()
@@ -50,6 +52,52 @@ def relative_path(raw):
     return Path(*path.parts)
 
 
+def validate_alias_name(alias_name, source_name):
+    """Accept one ordinary OBB basename, never a path or the source's own name."""
+    if (not isinstance(alias_name, str) or not ALIAS_NAME.fullmatch(alias_name)
+            or alias_name == source_name):
+        raise ValueError("alias must be a distinct direct .obb basename")
+    return alias_name
+
+
+def _check_existing_alias(alias_path, source):
+    """Return whether alias_path is the exact safe relative link to source."""
+    try:
+        mode = alias_path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISLNK(mode):
+        try:
+            if os.path.samefile(alias_path, source):
+                raise ValueError("alias path collides with the selected source on this filesystem")
+        except FileNotFoundError:
+            pass
+        raise ValueError("alias path is already occupied by a non-symlink")
+    target = os.readlink(alias_path)
+    if target != source.name or Path(target).is_absolute() or "/" in target or "\\" in target:
+        raise ValueError("existing alias must be a relative link to the selected source basename")
+    try:
+        resolved = alias_path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError) as error:
+        raise ValueError("existing alias is dangling or unsafe") from error
+    if resolved != source:
+        raise ValueError("existing alias does not resolve to the selected source")
+    return True
+
+
+def _ensure_alias(alias_path, source):
+    if _check_existing_alias(alias_path, source):
+        return
+    try:
+        # symlink creation is atomic and fails rather than replacing any existing path.
+        os.symlink(source.name, alias_path)
+    except FileExistsError:
+        if not _check_existing_alias(alias_path, source):
+            raise ValueError("alias path changed while it was being created")
+    if not _check_existing_alias(alias_path, source):
+        raise ValueError("could not verify the new source alias")
+
+
 def checked_cluster_chains(fat):
     """Reject malformed FAT cycles while retaining the pinned library's cluster reader."""
     original = fat.get_cluster_chain
@@ -83,7 +131,7 @@ def copy_entry(fat, entry, destination):
         raise ValueError("FAT chain shorter than file length")
 
 
-def extract(source, root, expected_owner):
+def extract(source, root, expected_owner, alias_name=None):
     try:
         from pyfatfs.PyFatFS import PyFatFS
     except ModuleNotFoundError as error:
@@ -99,6 +147,10 @@ def extract(source, root, expected_owner):
     before, meta = metadata(source)
     if meta["owner"] != expected_owner:
         raise ValueError("unexpected OBB owner")
+    if alias_name is not None:
+        validate_alias_name(alias_name, source.name)
+        alias_path = root / alias_name
+        _check_existing_alias(alias_path, source)
     marker_text = f"{before.st_size}:{before.st_mtime_ns // 1000000}\n"
     output = Path(str(source) + SUFFIX)
     if output.exists() or output.is_symlink():
@@ -108,7 +160,15 @@ def extract(source, root, expected_owner):
             for child in output.rglob("*"):
                 if child.is_symlink() or not (child.is_dir() or child.is_file()):
                     raise ValueError("existing output contains a symlink or special file")
-            return {"source": source.name, "output": str(output), "reused": True, **meta}
+            result = {"source": source.name, "output": str(output), "reused": True, **meta}
+            if alias_name is not None:
+                after = source.stat()
+                if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+                        after.st_size, after.st_mtime_ns, after.st_ino):
+                    raise ValueError("source changed while validating ready extraction")
+                _ensure_alias(alias_path, source)
+                result["alias"] = alias_name
+            return result
         raise ValueError("existing output lacks matching ready marker; refusing overwrite")
     stage = Path(tempfile.mkdtemp(prefix=".frameport-obb-stage-", dir=root))
     files = 0
@@ -158,8 +218,12 @@ def extract(source, root, expected_owner):
                 directory.chmod(0o755)
         stage.chmod(0o755)
         os.rename(stage, output)
-        return {"source": source.name, "output": str(output), "reused": False,
-                "files": files, "bytes": total, **meta}
+        result = {"source": source.name, "output": str(output), "reused": False,
+                  "files": files, "bytes": total, **meta}
+        if alias_name is not None:
+            _ensure_alias(alias_path, source)
+            result["alias"] = alias_name
+        return result
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -168,7 +232,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--owner", required=True, help="exact package recorded in the AOSP OBB footer")
+    parser.add_argument("--alias", help="optional direct .obb basename symlink to create after extraction validates")
     parser.add_argument("sources", type=Path, nargs="+")
     args = parser.parse_args()
     for source in args.sources:
-        print(json.dumps(extract(source, args.root, args.owner)), flush=True)
+        print(json.dumps(extract(source, args.root, args.owner, args.alias)), flush=True)

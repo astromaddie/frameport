@@ -5,9 +5,10 @@ the reviewed `frameport.civ` helper DEX and changes the single native MAIN activ
 helper serves only validated, pre-extracted OBB directories. It falls back to Android's original OBB service whenever
 the source image, key, location, or ready marker does not match.
 
-On the tested build, all ten requested OBBs mount successfully with this helper. The game then hits a separate native
-null-pointer crash during initialization. This utility repairs the OBB failure; full game startup remains under
-investigation and gameplay is unverified.
+In the current device run, the lowercase `base.obb` alias allowed all eleven requested OBB mounts, including the
+uppercase `Base.obb` image, and the earlier `PLY_Projector` missing-lookup crash did not recur. The run continued
+with balanced VR frame submission beyond 90 seconds. The off-head compositor capture was dark, so headset visuals
+and gameplay remain unverified.
 
 The packager requires explicit JDK and Android SDK paths. Use JDK 17, Android API 31 (API 26 or newer is accepted),
 and the matching Android build-tools `d8`. It does not download or bundle tools. From a FramePort source checkout:
@@ -43,8 +44,16 @@ Extract each OBB with an explicit footer owner and its own root directory:
 python scripts/civilization_directory_obb/extract_obb.py \
   --root /path/to/Android/obb/com.mrf.firaxis.invernessdemo \
   --owner com.firaxis.invernessdemo \
-  /path/to/Android/obb/com.mrf.firaxis.invernessdemo/main.obb
+  --alias base.obb \
+  /path/to/Android/obb/com.mrf.firaxis.invernessdemo/Base.obb
 ```
+
+The current native code probes the literal lowercase `base.obb` and skips the Base BLP mount if that name is absent,
+even when the original image is named `Base.obb`. Use `--alias base.obb` only for that case. After validating the
+unencrypted OBB footer, owner, source stability, and a complete ready extraction, the utility atomically creates the
+relative symlink `base.obb -> Base.obb` in the selected root. It never renames or copies the source. A matching safe
+alias is reused; a regular file, directory, dangling link, unsafe link, or link to another OBB causes an error without
+replacing it. The option is optional and normal extraction does not create aliases.
 
 The extractor accepts unencrypted AOSP v1 OBB footers with a matching FAT payload only. It reads the OBB without
 modifying it, rejects unsafe paths and mismatched owners, and atomically publishes app-readable files/directories plus

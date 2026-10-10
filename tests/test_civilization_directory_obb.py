@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import re
@@ -296,8 +297,17 @@ def _extractor():
         raise
 
 
-def _make_obb(root: Path, PyFat, PyFatFS) -> Path:
-    source = root / "main.obb"
+def _run_extractor_cli(root: Path, source: Path, alias_name: str | None = None) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(SCRIPT_DIR / "extract_obb.py"), "--root", str(root),
+               "--owner", OBB_OWNER]
+    if alias_name is not None:
+        command.extend(("--alias", alias_name))
+    command.append(str(source))
+    return subprocess.run(command, capture_output=True, text=True)
+
+
+def _make_obb(root: Path, PyFat, PyFatFS, name: str = "main.obb") -> Path:
+    source = root / name
     source.touch()
     formatter = PyFat()
     formatter.mkfs(str(source), PyFat.FAT_TYPE_FAT16, size=8 * 1024 * 1024)
@@ -329,9 +339,17 @@ def test_extractor_requires_matching_owner_and_reuses_only_safe_complete_output(
     marker = output / extractor.MARKER
     ready_text = marker.read_text()
     marker.write_text("stale\n")
+    alias_path = tmp_path / "base.obb"
     with pytest.raises(ValueError, match="lacks matching ready marker"):
-        extractor.extract(source, tmp_path, OBB_OWNER)
+        extractor.extract(source, tmp_path, OBB_OWNER, alias_name="base.obb")
+    assert not alias_path.exists() and not alias_path.is_symlink()
     marker.write_text(ready_text)
+    reused = extractor.extract(source, tmp_path, OBB_OWNER, alias_name="base.obb")
+    assert reused["reused"] is True
+    assert reused["alias"] == "base.obb"
+    assert alias_path.is_symlink() and os.readlink(alias_path) == source.name
+    assert alias_path.resolve(strict=True) == source.resolve(strict=True)
+    assert extractor.extract(source, tmp_path, OBB_OWNER, alias_name="base.obb")["reused"] is True
     outside = tmp_path / "outside.txt"
     outside.write_text("must not be trusted")
     asset = output / "Game/Assets/Example.Data"
@@ -370,11 +388,156 @@ def test_extractor_rejects_unsafe_paths_symlinks_and_wrong_root(tmp_path: Path):
     link = tmp_path / "linked.obb"
     link.symlink_to(source)
     with pytest.raises(ValueError, match="symlink"):
-        extractor.extract(link, tmp_path, OBB_OWNER)
+        extractor.extract(link, tmp_path, OBB_OWNER, alias_name="base.obb")
+    assert not (tmp_path / "base.obb").exists()
     wrong_root = tmp_path / "Game"
     wrong_root.mkdir()
     with pytest.raises(ValueError, match="outside selected OBB folder"):
         extractor.extract(source, wrong_root, OBB_OWNER)
+
+
+@pytest.mark.parametrize("alias_name", [
+    "", ".obb", "../base.obb", "/tmp/base.obb", "sub/base.obb", "..\\base.obb", "base.txt", "base.obb\0",
+])
+def test_extractor_rejects_non_basename_aliases(tmp_path: Path, alias_name: str):
+    extractor = _extractor()
+    with pytest.raises(ValueError, match="direct .obb basename"):
+        extractor.validate_alias_name(alias_name, "Base.obb")
+
+
+@pytest.mark.parametrize("conflict", [
+    "regular", "directory", "dangling", "other-target", "escape", "absolute-escape",
+])
+def test_extractor_never_replaces_alias_collisions(tmp_path: Path, conflict: str):
+    extractor = _extractor()
+    PyFat = pytest.importorskip("pyfatfs.PyFat").PyFat
+    PyFatFS = pytest.importorskip("pyfatfs.PyFatFS").PyFatFS
+    source = _make_obb(tmp_path, PyFat, PyFatFS, "Canonical.obb")
+    alias = tmp_path / "base.obb"
+    original_source = (hashlib.sha256(source.read_bytes()).hexdigest(), source.stat().st_size,
+                       source.stat().st_mtime_ns)
+    other = tmp_path / "other.obb"
+    other.write_bytes(b"different target")
+    if conflict == "regular":
+        alias.write_bytes(b"keep regular file")
+    elif conflict == "directory":
+        alias.mkdir()
+        (alias / "keep.txt").write_text("keep directory")
+    elif conflict == "dangling":
+        alias.symlink_to("missing.obb")
+    elif conflict == "escape":
+        alias.symlink_to("../outside.obb")
+    elif conflict == "absolute-escape":
+        outside = tmp_path / "outside.obb"
+        outside.write_bytes(b"outside root")
+        alias.symlink_to(outside)
+    else:
+        alias.symlink_to(other.name)
+    with pytest.raises(ValueError, match="alias path is already occupied|existing alias"):
+        extractor.extract(source, tmp_path, OBB_OWNER, alias_name="base.obb")
+    assert not Path(str(source) + extractor.SUFFIX).exists()
+    assert (hashlib.sha256(source.read_bytes()).hexdigest(), source.stat().st_size,
+            source.stat().st_mtime_ns) == original_source
+    if conflict == "regular":
+        assert alias.read_bytes() == b"keep regular file"
+    elif conflict == "directory":
+        assert (alias / "keep.txt").read_text() == "keep directory"
+    elif conflict == "dangling":
+        assert alias.is_symlink() and os.readlink(alias) == "missing.obb"
+    elif conflict == "escape":
+        assert alias.is_symlink() and os.readlink(alias) == "../outside.obb"
+    elif conflict == "absolute-escape":
+        assert alias.is_symlink() and Path(os.readlink(alias)).is_absolute()
+    else:
+        assert alias.is_symlink() and os.readlink(alias) == other.name
+
+
+def test_extractor_cli_creates_relative_alias_for_real_fat_fixture(tmp_path: Path):
+    extractor = _extractor()
+    PyFat = pytest.importorskip("pyfatfs.PyFat").PyFat
+    PyFatFS = pytest.importorskip("pyfatfs.PyFatFS").PyFatFS
+    source = _make_obb(tmp_path, PyFat, PyFatFS, "Base.obb")
+    alias_name = "base.obb"
+    assert extractor.validate_alias_name(alias_name, source.name) == alias_name
+    alias_path = tmp_path / alias_name
+    if alias_path.exists():
+        # Default macOS volumes are case-insensitive, so use a distinct direct basename there.
+        with pytest.raises(ValueError, match="collides with the selected source"):
+            extractor.extract(source, tmp_path, OBB_OWNER, alias_name=alias_name)
+        alias_name = "base-alias.obb"
+        alias_path = tmp_path / alias_name
+    before = source.stat()
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    first_run = _run_extractor_cli(tmp_path, source)
+    assert first_run.returncode == 0, first_run.stderr
+    first_report = json.loads(first_run.stdout)
+    assert first_report["reused"] is False
+    assert "alias" not in first_report
+    assert not alias_path.exists() and not alias_path.is_symlink()
+    result = _run_extractor_cli(tmp_path, source, alias_name)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    extraction = Path(report["output"])
+    assert extraction == Path(str(source) + extractor.SUFFIX)
+    assert report["alias"] == alias_name
+    assert report["reused"] is True
+    assert (extraction / "Game/Assets/Example.Data").read_bytes() == b"verified game bytes\0" * 100
+    assert alias_path.is_symlink()
+    assert os.readlink(alias_path) == source.name
+    assert alias_path.resolve(strict=True) == source.resolve(strict=True)
+    reused_run = _run_extractor_cli(tmp_path, source, alias_name)
+    assert reused_run.returncode == 0, reused_run.stderr
+    reused_report = json.loads(reused_run.stdout)
+    assert reused_report["reused"] is True
+    assert reused_report["alias"] == alias_name
+    after = source.stat()
+    assert (after.st_size, after.st_mtime_ns, after.st_ino) == (before.st_size, before.st_mtime_ns, before.st_ino)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+
+
+def test_extractor_cli_refuses_conflict_and_stale_ready_alias(tmp_path: Path):
+    PyFat = pytest.importorskip("pyfatfs.PyFat").PyFat
+    PyFatFS = pytest.importorskip("pyfatfs.PyFatFS").PyFatFS
+    conflict_root = tmp_path / "conflict"
+    conflict_root.mkdir()
+    conflict_source = _make_obb(conflict_root, PyFat, PyFatFS, "Canonical.obb")
+    conflict_alias = conflict_root / "base.obb"
+    conflict_alias.write_bytes(b"do not replace")
+    conflict_hash = hashlib.sha256(conflict_source.read_bytes()).hexdigest()
+    conflict_stat = conflict_source.stat()
+    failed_conflict = _run_extractor_cli(conflict_root, conflict_source, "base.obb")
+    assert failed_conflict.returncode != 0
+    assert "alias path is already occupied" in failed_conflict.stderr
+    assert conflict_alias.read_bytes() == b"do not replace"
+    assert not Path(str(conflict_source) + ".frameport-extracted").exists()
+    assert hashlib.sha256(conflict_source.read_bytes()).hexdigest() == conflict_hash
+    assert (conflict_source.stat().st_size, conflict_source.stat().st_mtime_ns) == (
+        conflict_stat.st_size, conflict_stat.st_mtime_ns
+    )
+
+    stale_root = tmp_path / "stale"
+    stale_root.mkdir()
+    stale_source = _make_obb(stale_root, PyFat, PyFatFS, "Base.obb")
+    stale_alias_name = "base.obb"
+    if (stale_root / stale_alias_name).exists():
+        stale_alias_name = "base-alias.obb"
+    first_run = _run_extractor_cli(stale_root, stale_source)
+    assert first_run.returncode == 0, first_run.stderr
+    stale_report = json.loads(first_run.stdout)
+    ready_marker = Path(stale_report["output"]) / ".frameport-obb-ready"
+    ready_marker.write_text("stale\n")
+    source_hash = hashlib.sha256(stale_source.read_bytes()).hexdigest()
+    source_stat = stale_source.stat()
+    failed_stale = _run_extractor_cli(stale_root, stale_source, stale_alias_name)
+    assert failed_stale.returncode != 0
+    assert "lacks matching ready marker" in failed_stale.stderr
+    assert not (stale_root / stale_alias_name).exists()
+    assert not (stale_root / stale_alias_name).is_symlink()
+    assert ready_marker.read_text() == "stale\n"
+    assert hashlib.sha256(stale_source.read_bytes()).hexdigest() == source_hash
+    assert (stale_source.stat().st_size, stale_source.stat().st_mtime_ns) == (
+        source_stat.st_size, source_stat.st_mtime_ns
+    )
 
 
 def test_extractor_rejects_encrypted_or_invalid_fat_images(tmp_path: Path):
