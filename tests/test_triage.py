@@ -112,6 +112,31 @@ def test_uncorrelated_vold_loop_error_is_filtered_with_or_without_package():
     }
 
 
+def test_lepton_target_process_marker_filters_unrelated_system_exit():
+    log = ("10-10 10:35:43.331   409   409 I WebViewLoader-: System.exit called, status: 0\n"
+           "10-10 10:35:43.341   218   237 I LeptonProcessObserver: Process died: 409\n"
+           "10-10 10:35:48.303   218   237 I LeptonProcessObserver: Target process "
+           "(com.example.game) found: 1208\n"
+           "10-10 10:35:50.921  1208  1240 F libc    : Fatal signal 11 (SIGSEGV), code 1 "
+           "(SEGV_MAPERR), pid 1208 (example.game)\n")
+
+    findings = {finding.id for finding in triage(log, "EXITED", "com.example.game").findings}
+    assert "native-crash" in findings
+    assert "force-quit" not in findings
+
+
+def test_lepton_target_process_marker_requires_exact_package():
+    log = ("10-10 10:35:43.331   409   409 I WebViewLoader-: System.exit called, status: 0\n"
+           "10-10 10:35:43.320   1000  1000 I ActivityManager: Start proc 1208:com.example.game/u0a14\n"
+           "10-10 10:35:48.303   218   237 I LeptonProcessObserver: Target process "
+           "(com.other.game) found: 409\n"
+           "10-10 10:35:50.921  1208  1240 F libc    : Fatal signal 11 (SIGSEGV)\n")
+
+    findings = {finding.id for finding in triage(log, "EXITED", "com.example.game").findings}
+    assert "force-quit" not in findings
+    assert "native-crash" in findings
+
+
 def test_app_message_cannot_impersonate_vold_loop_control_error():
     log = ("10-09 11:07:23.355  1213  1242 E Game: Failed to open loop-control: No such file or directory\n"
            "10-09 11:07:23.356  1213  1213 D ObbLoader: path=/storage/emulated/0/Android/obb/"

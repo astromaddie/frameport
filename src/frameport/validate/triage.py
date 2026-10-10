@@ -65,6 +65,9 @@ def game_lines(log: str, package: str | None = None) -> list[str]:
         m = re.search(r"Start proc (\d+):" + re.escape(package), ln)
         if m:
             pids.add(m[1])
+        m = re.search(r"LeptonProcessObserver: Target process \(" + re.escape(package) + r"\) found:\s*(\d+)", ln)
+        if m:
+            pids.add(m[1])
     if not pids:
         return lines
     out = []
