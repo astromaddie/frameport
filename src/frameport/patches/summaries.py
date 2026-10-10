@@ -55,6 +55,8 @@ SUMMARIES = {
     "frame.ovrstubs": "Provides stand-ins for Meta store functions the game expects, so it doesn't crash at start.",
     "frame.langpacks": "Lets the game find language files (like de.lang) that are already in its data, instead of "
                        "waiting for a download that never comes.",
+    "frame.platform_version_callback": "Lets a game continue when its platform loader cannot provide version "
+                                       "information.",
     "frame.ovr_trace": "For troubleshooting: records the game's requests to Meta's platform services and which ones "
                        "never get an answer.",
     "frame.unity_user_presence": "Counts the headset as worn, so games that only move the player while it's worn "

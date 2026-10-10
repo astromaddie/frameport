@@ -34,6 +34,22 @@ def with_assets(lib: bytes) -> bytes:
     at += len(ASSETS_MARK)
     return lib[:at] + b"1" + lib[at + 1:]
 
+
+def with_configuration_from(lib: bytes, previous: bytes) -> bytes:
+    """Carry the existing Metadata and asset-file switch into a rebuilt library."""
+    meta_at, previous_meta_at = lib.find(META_MARK), previous.find(META_MARK)
+    if meta_at >= 0 and previous_meta_at >= 0:
+        start = meta_at + len(META_MARK)
+        previous_start = previous_meta_at + len(META_MARK)
+        if start + META_LEN <= len(lib) and previous_start + META_LEN <= len(previous):
+            lib = lib[:start] + previous[previous_start:previous_start + META_LEN] + lib[start + META_LEN:]
+    assets_at, previous_assets_at = lib.find(ASSETS_MARK), previous.find(ASSETS_MARK)
+    if assets_at >= 0 and previous_assets_at >= 0 and previous_assets_at + len(ASSETS_MARK) < len(previous):
+        at = assets_at + len(ASSETS_MARK)
+        lib = lib[:at] + previous[previous_assets_at + len(ASSETS_MARK):previous_assets_at + len(ASSETS_MARK) + 1] \
+            + lib[at + 1:]
+    return lib
+
 # Every function native/langpack/langpack.c defines. The loader's own exports of these are hidden (see
 # elf.hide_exports) so lookups reach LIB first; tests/test_langpack.py keeps this list equal to the C source.
 EXPORTS = (
@@ -43,7 +59,8 @@ EXPORTS = (
     "ovr_AssetFileDownloadResult_GetAssetId", "ovr_AssetFileDownloadResult_GetFilepath",
     "ovr_AssetFileDownloadUpdate_GetAssetFileId", "ovr_AssetFileDownloadUpdate_GetBytesTotal",
     "ovr_AssetFileDownloadUpdate_GetBytesTransferred", "ovr_AssetFileDownloadUpdate_GetCompleted",
-    "ovr_AssetFile_DownloadById", "ovr_AssetFile_GetList", "ovr_AssetFile_StatusById", "ovr_Error_GetCode",
+    "ovr_Application_GetVersion", "ovr_AssetFile_DownloadById", "ovr_AssetFile_GetList",
+    "ovr_AssetFile_StatusById", "ovr_Error_GetCode",
     "ovr_Error_GetDisplayableMessage", "ovr_Error_GetHttpCode",
     "ovr_Error_GetMessage", "ovr_FreeMessage", "ovr_LanguagePackInfo_GetEnglishName",
     "ovr_LanguagePackInfo_GetNativeName", "ovr_LanguagePackInfo_GetTag", "ovr_LanguagePack_GetCurrent",
@@ -52,6 +69,10 @@ EXPORTS = (
     "ovr_Message_GetRequestID",
     "ovr_Message_GetType", "ovr_Message_IsError", "ovr_PopMessage",
 )
+
+# The version callback belongs to its own exact-loader patch. Keep language/asset handling's historical behavior
+# unchanged, even when its library now also contains the optional wrapper.
+LANGPACK_EXPORTS = tuple(name for name in EXPORTS if name != "ovr_Application_GetVersion")
 
 
 class LanguagePacks(Patch):
@@ -80,7 +101,7 @@ class LanguagePacks(Patch):
         if ws.abi != "arm64-v8a" or not ws.has(ws.lib(LOADER)):
             return False
         loader = ws.read_lib(LOADER)
-        patched, hidden = elf.hide_exports(loader, EXPORTS)
+        patched, hidden = elf.hide_exports(loader, LANGPACK_EXPORTS)
         if not hidden and LIB in elf.needed(loader):
             return False  # applied by an earlier build
         if not hidden:
@@ -130,7 +151,7 @@ class AssetFiles(Patch):
             return False
         loader = ws.read_lib(LOADER)
         if LIB not in elf.needed(loader):  # frame.langpacks didn't link the library: do it here
-            patched, hidden = elf.hide_exports(loader, EXPORTS)
+            patched, hidden = elf.hide_exports(loader, LANGPACK_EXPORTS)
             if not hidden:
                 ctx.notes.append("the platform loader has none of the asset-file functions: nothing to replace")
                 return False

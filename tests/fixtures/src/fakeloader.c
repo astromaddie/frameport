@@ -7,7 +7,7 @@
 #include <string.h>
 
 typedef uint64_t u64;
-typedef struct { uint32_t type; u64 req; int err; } fmsg;
+typedef struct { uint32_t type; u64 req; int err, err_code; char err_message[128]; } fmsg;
 typedef struct { u64 id; char type[16]; char path[32]; } fdet;
 
 static fmsg *q[16];
@@ -21,6 +21,8 @@ static u64 post(uint32_t type, int err) {
     m->type = type;
     m->req = next_req++;
     m->err = err;
+    m->err_code = err ? 429 : 0;
+    if (err) strcpy(m->err_message, "the dispatcher's real version error");
     q[qn++] = m;
     return m->req;
 }
@@ -32,6 +34,11 @@ u64 ovr_AssetFile_GetList(void) {
 u64 ovr_AssetFile_StatusById(u64 id) { return post(0x5D955D38u, id != 7); }
 u64 ovr_LanguagePack_GetCurrent(void) { return 0; }
 u64 ovr_LanguagePack_SetCurrent(const char *tag) { (void)tag; return 0; }
+u64 ovr_Application_GetVersion(void) {
+    const char *response = getenv("FAKE_VERSION_RESPONSE");
+    if (!response) return 0;
+    return post(0x68670A0Eu, strcmp(response, "error") == 0);
+}
 
 void *ovr_PopMessage(void) {
     if (!qn) return NULL;
@@ -43,7 +50,7 @@ void ovr_FreeMessage(void *m) { freed++; free(m); }
 uint32_t ovr_Message_GetType(const void *m) { return ((const fmsg *)m)->type; }
 u64 ovr_Message_GetRequestID(const void *m) { return ((const fmsg *)m)->req; }
 _Bool ovr_Message_IsError(const void *m) { return ((const fmsg *)m)->err != 0; }
-void *ovr_Message_GetError(const void *m) { (void)m; return NULL; }
+void *ovr_Message_GetError(const void *m) { return ((const fmsg *)m)->err ? (void *)m : NULL; }
 void *ovr_Message_GetAssetDetails(const void *m) { return ((const fmsg *)m)->err ? NULL : &store; }
 void *ovr_Message_GetAssetDetailsArray(const void *m) { (void)m; return &arr_handle; }
 size_t ovr_AssetDetailsArray_GetSize(const void *a) { (void)a; return 1; }
@@ -55,6 +62,8 @@ const char *ovr_AssetDetails_GetFilepath(const void *d) { return ((const fdet *)
 const char *ovr_AssetDetails_GetIapStatus(const void *d) { (void)d; return "free"; }
 void *ovr_AssetDetails_GetLanguage(const void *d) { (void)d; return NULL; }
 const char *ovr_AssetDetails_GetMetadata(const void *d) { (void)d; return ""; }
+int ovr_Error_GetCode(const void *e) { return ((const fmsg *)e)->err_code; }
+const char *ovr_Error_GetMessage(const void *e) { return ((const fmsg *)e)->err_message; }
 
 // not part of the SDK: lets the test see that our wrapper frees the dispatcher's own message
 int fake_freed(void) { return freed; }

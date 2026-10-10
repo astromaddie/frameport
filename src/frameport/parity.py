@@ -27,7 +27,7 @@ from .sources import quest_dump
 
 OWNED = {"libopenxr_loader_generic.so": "FrameBridge adapter", "libvrapi.so": "VrApi bridge", "libglshim.so": "GL shim",
          "libovrplatformcompat.so": "platform compat", "libfp_vk.so": "Vulkan shim",
-         "libfp_ovrp.so": "legacy Unity OVRPlugin shim"}
+         "libfp_ovrp.so": "legacy Unity OVRPlugin shim", "libfp_langpack.so": "platform callback/library shim"}
 
 
 def _default_rewrites(base: str, old: bytes) -> list[tuple[bytes, str]]:
@@ -142,6 +142,12 @@ def classify(name: str, new: bytes, old: bytes) -> tuple[str, str]:
         ignore = {"libovrstubs.so", COMPAT}
         if set(elf.needed(new)) - ignore == set(elf.needed(old)) - ignore and COMPAT in elf.needed(new):
             return "expected", "same loader, linked to the platform compat library by the OVRPort CLI 1.2.5+"
+    if base == "libovrplatformloader.so":
+        from .patches.frame.platform_version_callback import patch_loader
+
+        fixed = patch_loader(old)
+        if fixed is not None and fixed == new:
+            return "expected", "verified zero-return Application_GetVersion stub linked to the platform callback shim"
     if base in OWNED:
         current = (artifacts_dir() / name.split("/")[1] / base) if name.startswith("lib/") else None
         is_current = current is not None and current.exists() and current.read_bytes() == new

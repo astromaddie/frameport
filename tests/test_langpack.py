@@ -29,6 +29,7 @@ CC = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
 pytestmark = pytest.mark.skipif(not CC or platform.system() != "Linux", reason="needs a C compiler on Linux")
 
 GETLIST, STATUSBYID, GETCURRENT, SETCURRENT = 0x4AFC6F74, 0x5D955D38, 0x1F90F0D5, 0x5B4FBBE0
+APP_GETVERSION = 0x68670A0E
 VOIDP = C.c_void_p
 
 
@@ -231,6 +232,44 @@ def test_set_current_unknown_pack_is_an_error(api, packs):
         m = api.ask("ovr_LanguagePack_SetCurrent", tag)
         assert api.is_error(m) and not api.f("ovr_Message_GetAssetFileDownloadResult", VOIDP, VOIDP)(m)
         api.free(m)
+
+
+def test_application_get_version_zero_return_posts_unsupported_error(api, monkeypatch):
+    monkeypatch.delenv("FAKE_VERSION_RESPONSE", raising=False)
+    req = api.f("ovr_Application_GetVersion", C.c_uint64)()
+    assert req != 0
+    m = api.pop()
+    assert api.msg_type(m) == APP_GETVERSION and api.req_id(m) == req and api.is_error(m)
+    err = api.f("ovr_Message_GetError", VOIDP, VOIDP)(m)
+    assert api.f("ovr_Error_GetCode", C.c_int, VOIDP)(err) == 501
+    message = api.f("ovr_Error_GetMessage", C.c_char_p, VOIDP)(err)
+    assert b"unsupported" in message and b"version" in message
+    assert not api.f("ovr_Message_GetAssetDetails", VOIDP, VOIDP)(m)
+    before = api.loader.fake_freed()
+    api.free(m)
+    assert api.loader.fake_freed() == before  # our message is released locally, not by the foreign dispatcher
+
+
+@pytest.mark.parametrize("response", ["ok", "error"])
+def test_application_get_version_forwards_real_callback_and_error(api, monkeypatch, response):
+    monkeypatch.setenv("FAKE_VERSION_RESPONSE", response)
+    before = api.loader.fake_freed()
+    req = api.f("ovr_Application_GetVersion", C.c_uint64)()
+    assert req == 100  # the dispatcher's actual request id is returned unchanged
+    m = api.pop()
+    assert api.msg_type(m) == APP_GETVERSION and api.req_id(m) == req
+    err = api.f("ovr_Message_IsError", C.c_bool, VOIDP)(m)
+    assert err is (response == "error")
+    if err:
+        payload = api.f("ovr_Message_GetError", VOIDP, VOIDP)(m)
+        assert api.f("ovr_Error_GetCode", C.c_int, VOIDP)(payload) == 429
+        assert api.f("ovr_Error_GetMessage", C.c_char_p, VOIDP)(payload) == b"the dispatcher's real version error"
+        assert not api.f("ovr_Message_GetAssetDetails", VOIDP, VOIDP)(m)
+    else:
+        payload = api.f("ovr_Message_GetAssetDetails", VOIDP, VOIDP)(m)
+        assert api.details(payload)["id"] == 7  # existing callback payload remains visible
+    api.free(m)
+    assert api.loader.fake_freed() == before + 1  # exactly one foreign free
 
 
 def test_asset_list_adds_our_packs_to_the_loaders_list(api, packs):

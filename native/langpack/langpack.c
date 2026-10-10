@@ -101,6 +101,7 @@ static int g_traced;
 #define MSG_LANGUAGEPACK_SETCURRENT 0x5B4FBBE0u
 #define MSG_ASSETFILE_DOWNLOADBYID 0x2D008992u
 #define MSG_NOTIFICATION_DOWNLOADUPDATE 0x2FDD0CCDu
+#define MSG_APPLICATION_GETVERSION 0x68670A0Eu
 
 #define MAXP 32
 #define PATHLEN 1024
@@ -215,6 +216,7 @@ DEFORIG(const char *, AssetFileDownloadResult_GetFilepath, (const void *r), (r))
 DEFORIG(u64, AssetFile_GetList, (void), ())
 DEFORIG(u64, AssetFile_StatusById, (u64 id), (id))
 DEFORIG(u64, AssetFile_DownloadById, (u64 id), (id))
+DEFORIG(u64, Application_GetVersion, (void), ())
 DEFORIG(void *, Message_GetAssetFileDownloadUpdate, (const void *m), (m))
 DEFORIG(u64, AssetFileDownloadUpdate_GetAssetFileId, (const void *u), (u))
 DEFORIG(u64, AssetFileDownloadUpdate_GetBytesTotal, (const void *u), (u))
@@ -879,6 +881,22 @@ EXPORT void ovr_FreeMessage(void *h) {
     pthread_mutex_unlock(&g_lock);
     if (m->orig_msg) o_FreeMessage(m->orig_msg);
     free(m);
+}
+
+// C-Smash's OVRPort loader has an Application_GetVersion export that returns request id 0 without posting a message.
+// The caller waits for a callback forever. frame.platform_version_callback hides that exact stub and links this
+// wrapper; other requests and messages still pass through the dispatcher's original functions unchanged.
+EXPORT u64 ovr_Application_GetVersion(void) {
+    u64 req = o_Application_GetVersion();
+    if (req) return req;
+    msg_t *m = new_msg(MSG_APPLICATION_GETVERSION, 0);
+    if (!m) return 0;
+    u64 request_id = m->req;
+    fail(m, 501, "application version lookup is unsupported by this platform loader");
+    post(m);
+    fplog("Application_GetVersion: dispatcher returned 0; queued unsupported-version error request %llu",
+          (unsigned long long)request_id);
+    return request_id;
 }
 
 EXPORT u32 ovr_Message_GetType(const void *h) {
