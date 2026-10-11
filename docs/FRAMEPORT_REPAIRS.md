@@ -274,11 +274,32 @@ Raw decoding alone already exceeded 128 fps, so the decoder alone is not establi
 
 The final bundle SHA-256 is `55b2d6774847e931eef4bf8a32627693ca1505e255b0e7f0bf7aeb897b87d508`.
 Normal startup renders the C-Smash logo, scene, and hands; the mounted bundle hash matches, and temporary snapshot
-settings were removed before wearer handoff. Real Ball Coaxing playback smoothness, color, and worn frame rate
-remain unverified. The trial is not automatically selected by any recipe. Original bundle and device-local data
+settings were removed before wearer handoff. The wearer subsequently reported improved performance, but the ball
+still appeared difficult to track during actual gameplay. This is partial acceptance, not a complete performance fix.
+The trial is not automatically selected by any recipe. Original bundle and device-local data
 backup remain available. Private conversion, parity, quality, surface-test, and capture evidence lives under
 `csmash/performance-20261011/`, including `repro-source-run/receipt.json`, `surface-color-comparison.txt`, and
 `color-preserved-v2/`. No game assets or diagnostic APK are included in this repository change.
+
+### Worn follow-up: 90 Hz is already active
+
+The follow-up run confirms that there is no global 60 fps cap: SteamVR reports a 90 Hz preference and an actual
+90.000008 Hz display rate from 10:31:01 JST. The application also submits approximately 89–90 frames/second in
+focused windows before the session leaves `FOCUSED` at 10:32:37. Separate focused windows around tutorial playback
+still drop to 48.4–54.8 fps. These video-associated dips do not establish the cause of the wearer's rough ball
+motion in actual gameplay. Five-second averages also cannot establish evenly spaced individual frames.
+
+The game's serialized headset profiles request 72 Hz for Quest 1/2/Pro and 90 Hz for Quest 3/future devices. The
+existing adapter supports a per-title refresh override, but no override is justified when 90 Hz is already active.
+Static inspection of all eight ball prefabs found enabled Fusion NetworkTransform components with interpolation
+targets pointing to the actual ball mesh children. Ball simulation advances in `FixedUpdateNetwork` using the
+Fusion runner clock, while NetworkTransform performs render interpolation. The generic Unity 0.02-second fixed
+timestep therefore does not establish a 50 Hz ball-motion cap. No disabled-interpolation defect was identified.
+
+Residual gameplay roughness requires per-frame pacing evidence and, if pacing is even, runtime ball simulation/
+render-pose evidence. Physics rates and interpolation behavior have not been changed speculatively. The private
+follow-up evidence is `worn-feedback-launch.log`, `refresh-read-only.txt`, and `ball-interpolation-static.json` under
+the same performance evidence directory. Worn gameplay motion quality remains unresolved.
 
 ## Build identities
 
