@@ -242,6 +242,44 @@ near the drop, but this correlation does not establish the bottleneck. No settin
 this read-only check. The private receipt is
 `frameport-audit-20261011/csmash-worn-performance/result.json` with the original launch log and installed APK hash.
 
+### Opt-in tutorial video performance trial
+
+The privately inspected 1.2.0.7 assets contain one 3840×2160, 59.94 fps tutorial video, `CSVRS - Ball Coaxing`.
+The other eleven clips are 1280×720. All six scene VideoPlayers use the existing fixed 1280×720 tutorial
+RenderTexture and loop playback; the selected clip lasts 8.98 seconds. This makes repeated video playback a
+plausible contributor to the sustained slow interval, but the worn log does not identify the active clip.
+
+[prepare_csmash_video_trial.py](../scripts/prepare_csmash_video_trial.py) creates a private, experimental bundle
+with only that clip resized to the existing target dimensions. It requires the exact original bundle SHA-256
+`cfcd39939ec752b5151fc82af2d1a92dabeea72d5e85c36f3eac8a0882e42a7c`, UnityPy 1.25.4, and FFmpeg with libx264.
+It preserves cadence, frame count, duration, stream offsets, all other serialized objects, and the eleven other
+clip payloads, checking parity after reopening the output. It refuses unknown input or an existing output directory.
+It does not install anything or change the APK, callback repair, adapter, controller support, eye resolution, or MSAA.
+
+```sh
+python scripts/prepare_csmash_video_trial.py /private/original/videos_assets_all.bundle /private/new-trial
+```
+
+Explicit matching BT.2020 limited-range input/output matrices preserve the original video's effective Android
+color interpretation during resizing. A plain untagged 720p conversion would change Android's resolution-based
+color default and was rejected. The final output matches the original decoder's actual color standard/transfer/
+range (6/3/2), output dataspace (281411584), and SoftwareRenderer window dataspace (`0x8c60000`). Against the
+original resized with the same matrix and bilinear filter, all 538 frames measure SSIM 0.997790 and PSNR 51.229 dB.
+Four corresponding frame samples were visually consistent; these metrics do not substitute for in-game video QA.
+
+On the same Frame, an isolated decoder-plus-SoftwareRenderer surface test consumed all 538 frames in 7.520 seconds
+for the original and 1.095 seconds for the final candidate (71.54 versus 491.33 frames/second). Process CPU time
+fell from 7.267 to 1.119 seconds. This measures video processing headroom, **not Unity rendering or XR frame rate**.
+Raw decoding alone already exceeded 128 fps, so the decoder alone is not established as the game bottleneck.
+
+The final bundle SHA-256 is `55b2d6774847e931eef4bf8a32627693ca1505e255b0e7f0bf7aeb897b87d508`.
+Normal startup renders the C-Smash logo, scene, and hands; the mounted bundle hash matches, and temporary snapshot
+settings were removed before wearer handoff. Real Ball Coaxing playback smoothness, color, and worn frame rate
+remain unverified. The trial is not automatically selected by any recipe. Original bundle and device-local data
+backup remain available. Private conversion, parity, quality, surface-test, and capture evidence lives under
+`csmash/performance-20261011/`, including `repro-source-run/receipt.json`, `surface-color-comparison.txt`, and
+`color-preserved-v2/`. No game assets or diagnostic APK are included in this repository change.
+
 ## Build identities
 
 These SHA-256 values identify recorded APKs. They do not establish which file is currently installed after future
