@@ -16,7 +16,7 @@ device test performed while writing this document. Source references describe co
 | Until You Fall — `com.schellgames.untilyoufall` | Startup cubemap underlay crash; later legacy pose-time investigation | Wearer confirmed menu and gameplay on the earlier startup-repaired build. The later timing build survived an unattended run and corrected observed invalid view timestamps. | New timing build needs wearer QA. Low pointer angle and sluggish controllers were reported on the earlier playable build. |
 | TO THE TOP — `com.electrichatgames.tothetop_al` | Legacy `EndFrame` submission before a matching `BeginFrame`; later pose-time investigation | Wearer confirmed gameplay on an earlier trial, with severe tracking jitter. Later conditional-Begin and timestamp builds passed unattended frame-order checks. | Latest build needs wearer QA. Smooth tracking and pointer angle are not accepted. |
 | Civilization VII — `com.mrf.firaxis.invernessdemo` | OBB mount failures and a case-sensitive `Base.obb` lookup mismatch | Wearer confirmed menu and gameplay after directory loading and the filename alias were both present. | Low pointer angle, jitter, and the reported failure of Steam's End Game / Close App remain open. |
-| C-Smash VRS — `com.wolfandwood.csmashvs` | Menu initialization waited forever for an unsupported version request | Normal repaired build reached the Terms of Use panel and 3D scene in a direct game-frame capture. Steam launch and close were observed unattended. | Wearing the headset, accepting terms, gameplay, controllers, and online features have not been tested. |
+| C-Smash VRS — `com.wolfandwood.csmashvs` | Menu initialization waited forever for an unsupported version request | Normal repaired build reached the Terms of Use panel and 3D scene in a direct capture. The wearer subsequently reported that it works, with low frame rate. | Sustained 15.7–17.2 fps in the latest worn run. Detailed controller, full-game, and online acceptance remain unverified. |
 
 Source/package validation, unattended launch, and wearer acceptance are separate gates. A balanced OpenXR frame loop
 or an off-headset capture does not establish playable controller behavior, visual quality while worn, or frame rate.
@@ -222,10 +222,25 @@ flags completed. The normal production APK then produced a direct projection cap
 panel and 3D geometry. Only `libovrplatformloader.so` and the added `libfp_langpack.so` changed in that APK. The
 adapter, GL library, game code/assets, and original 4× MSAA remained byte-identical.
 
-Temporary snapshot settings were restored after capture. Terms were not accepted, and gameplay/controllers were
-not exercised. Three nonfatal achievement-manager null-reference exceptions occurred in both baseline and repaired
+Temporary snapshot settings were restored after the unattended capture. Terms were not accepted and gameplay/
+controllers were not exercised during that diagnostic. The wearer subsequently reported that C-Smash works, but
+feels slow. Three nonfatal achievement-manager null-reference exceptions occurred in both baseline and repaired
 runs and remain outside this repair. A SteamVR standby capture alone would have missed the positive game-frame
 evidence.
+
+### Subsequent worn frame-rate result
+
+The 2026-10-11 worn run used the same production APK, verified by its SHA-256 below. Its saved launch log records
+60.2 fps before a sustained drop to 15.7–17.2 fps across seven successive five-second reporting windows, ending at
+09:36:56 JST. This confirms the wearer's low-frame-rate report; startup success does not imply acceptable speed.
+
+The [adapter's pacing counter](../native/adapter/frame_adapter.c) counts `xrEndFrame` calls over monotonic elapsed
+time. The separate `displayTime vs predicted` columns measure submitted-versus-predicted display-time error;
+they are not CPU/GPU timings or hitch durations. Those columns reached roughly 58–64 ms average and 250.49 ms
+maximum during the slow interval. Software H.264 decoding (`OMX.google.h264.decoder` and `SoftwareRenderer`) starts
+near the drop, but this correlation does not establish the bottleneck. No settings or APK bytes were changed for
+this read-only check. The private receipt is
+`frameport-audit-20261011/csmash-worn-performance/result.json` with the original launch log and installed APK hash.
 
 ## Build identities
 
@@ -278,7 +293,10 @@ guards. Preserve a rollback APK/recipe, verify signed payloads and certificate c
 and record both startup evidence and wearer acceptance against the exact build hash. Copying all patches into a
 recipe without that diagnosis is not supported by this record.
 
-The open acceptance work is controller feel/pointing in the three played games, Civilization's worn Steam close
-behavior, and C-Smash's first worn gameplay test. Swarm 2's MSAA seams are a separate unresolved investigation;
+The open acceptance work is controller feel/pointing in the three earlier played games, Civilization's worn Steam
+close behavior, and C-Smash's performance and detailed gameplay/controller tests. RE4 was also wearer-confirmed
+working, but Steam's End Game failed; that separate exit investigation remains open. Its selected
+`patch_remove_unreal_force_quit` alternate also disables in-game Quit, so that button is not a substitute for
+repairing Steam shutdown. Swarm 2's MSAA seams are a separate unresolved investigation;
 disabling MSAA hides some artifacts but introduces jagged edges and is not a completed graphics repair. No 90 Hz
 or 120 Hz performance result is established by these four-game repairs.
