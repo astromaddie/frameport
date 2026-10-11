@@ -16,7 +16,7 @@ device test performed while writing this document. Source references describe co
 | Until You Fall — `com.schellgames.untilyoufall` | Startup cubemap underlay crash; later legacy pose-time investigation | Wearer confirmed menu and gameplay on the earlier startup-repaired build. The later timing build survived an unattended run and corrected observed invalid view timestamps. | New timing build needs wearer QA. Low pointer angle and sluggish controllers were reported on the earlier playable build. |
 | TO THE TOP — `com.electrichatgames.tothetop_al` | Legacy `EndFrame` submission before a matching `BeginFrame`; later pose-time investigation | Wearer confirmed gameplay on an earlier trial, with severe tracking jitter. Later conditional-Begin and timestamp builds passed unattended frame-order checks. | Latest build needs wearer QA. Smooth tracking and pointer angle are not accepted. |
 | Civilization VII — `com.mrf.firaxis.invernessdemo` | OBB mount failures and a case-sensitive `Base.obb` lookup mismatch | Wearer confirmed menu and gameplay after directory loading and the filename alias were both present. | Low pointer angle, jitter, and the reported failure of Steam's End Game / Close App remain open. |
-| C-Smash VRS — `com.wolfandwood.csmashvs` | Menu initialization waited forever for an unsupported version request | Normal repaired build reached the Terms of Use panel and 3D scene in a direct capture. The wearer subsequently reported that it works, with low frame rate. | Sustained 15.7–17.2 fps in the latest worn run. Detailed controller, full-game, and online acceptance remain unverified. |
+| C-Smash VRS — `com.wolfandwood.csmashvs` | Menu initialization waited forever for an unsupported version request; tutorial video processing cost | Wearer confirmed it works and the video trial improved performance. The display is 90 Hz; focused timing windows range from approximately 52 to 90 frame submissions/second. | Ball motion remains uneven regardless of visible video. Consistent 90 fps, rendered ball pose cadence, detailed controller, full-game, and online acceptance remain unverified. |
 
 Source/package validation, unattended launch, and wearer acceptance are separate gates. A balanced OpenXR frame loop
 or an off-headset capture does not establish playable controller behavior, visual quality while worn, or frame rate.
@@ -301,6 +301,37 @@ render-pose evidence. Physics rates and interpolation behavior have not been cha
 follow-up evidence is `worn-feedback-launch.log`, `refresh-read-only.txt`, and `ball-interpolation-static.json` under
 the same performance evidence directory. Worn gameplay motion quality remains unresolved.
 
+### Focused per-frame timing and remaining ball motion
+
+The wearer tested a private, default-off timing diagnostic and reported that actual ball motion remained uneven,
+regardless of video, with an apparent 60 fps cadence. The diagnostic captured 21 complete raw-runtime `FOCUSED`
+windows containing 8,372 submission intervals, with no dropped samples or OpenXR call failures. Early and late
+windows average 89.2–90.0 submissions/second: median intervals are approximately 11.1 ms and p95 is 11.8–12.1 ms.
+Middle windows average 52.2–84.2 submissions/second, with repeated p95/p99 intervals of approximately 22–23 ms.
+This confirms uneven application submission cadence during part of the run and rules out a fixed 60 fps submission
+cap. It does not measure displayed frames, GPU time, or the visible ball's pose-update cadence.
+
+`xrWaitFrame` averages approximately 0.015 ms and `xrEndFrame` approximately 0.4 ms. Some `xrBeginFrame` calls spend
+several milliseconds waiting while consuming little thread CPU. These measurements do not identify the work
+between the calls or establish the cause of ball roughness. Runtime `predictedDisplayPeriod` also varies between
+8.333 and 16.667 ms despite the separately verified 90 Hz display. Counters using that returned period must not be
+reported as fixed-90-Hz missed-frame counts; only aggregate quantiles were exported, so exact fixed-threshold counts
+cannot be recovered. Diagnostic overhead has not been measured against a matched normal run.
+
+Source inspection shows that the tutorial serve and powershot paths intentionally start a video before serving the
+ball and stop it at the corresponding tutorial end. Codec activity overlaps the slower windows, but there is no
+independent gameplay-state or video-visibility marker, and the wearer reports roughness regardless of video.
+Enabled interpolation targets and the per-update render-flag reset were checked; runtime interpolation mode,
+rendered ball positions, and actual Fusion tick cadence remain unknown. Changing refresh or physics rates on this
+evidence would not be justified. A subsequent probe needs to compare the visible ball's rendered pose with its
+simulation pose and frame timestamps on the game's own update thread.
+
+After this test, the exact normal callback-repair APK and both baseline settings files were restored with their
+original hashes, ownership, and modes. The repaired video bundle, current progress, and 90 Hz preference were
+preserved; C-Smash was stopped and the shared headset reservation released. Private evidence lives under
+`csmash/performance-20261011/timing-v2/device/`: `worn-diagnostic-launch.log`, `timing-analysis.json`,
+`timing-windows.csv`, and `restored.json`. The diagnostic APK is not a production performance repair.
+
 ## Build identities
 
 These SHA-256 values identify recorded APKs. They do not establish which file is currently installed after future
@@ -357,5 +388,6 @@ close behavior, and C-Smash's performance and detailed gameplay/controller tests
 working, but Steam's End Game failed; that separate exit investigation remains open. Its selected
 `patch_remove_unreal_force_quit` alternate also disables in-game Quit, so that button is not a substitute for
 repairing Steam shutdown. Swarm 2's MSAA seams are a separate unresolved investigation;
-disabling MSAA hides some artifacts but introduces jagged edges and is not a completed graphics repair. No 90 Hz
-or 120 Hz performance result is established by these four-game repairs.
+disabling MSAA hides some artifacts but introduces jagged edges and is not a completed graphics repair. C-Smash's
+follow-up establishes a 90 Hz display and near-90 submission stretches, while sustained smooth 90 fps gameplay
+remains unresolved. No 120 Hz performance result is established.
