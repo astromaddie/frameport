@@ -130,6 +130,7 @@ What FramePort adds itself: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | [COMPATIBILITY.md](docs/COMPATIBILITY.md) | What runs and how well |
 | [GAMES.md](docs/GAMES.md) | Tested games and how well they run |
 | [PLAYBOOK.md](docs/PLAYBOOK.md) | Symptoms and fixes per game |
+| [FRAMEPORT_REPAIRS.md](docs/FRAMEPORT_REPAIRS.md) | Four-game repair record: Unity, Civilization VII expansions, C-Smash callbacks |
 | [FRAME_RUNTIME.md](docs/FRAME_RUNTIME.md) | Steam Frame runtime facts |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the code is organised |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Code, recipes, translations |
