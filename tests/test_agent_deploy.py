@@ -1,5 +1,7 @@
 """Frame.ensure_agent: an older FramePort must not replace a newer agent on the Frame (2026-10-04: an app with agent
 43 put it back over 45 every few seconds, so the newer app's launcher helpers failed)."""
+import pytest
+
 from frameport.frame import connection
 
 
@@ -50,3 +52,11 @@ def test_older_or_missing_agent_is_replaced(monkeypatch, tmp_path):
 def test_agent_version_of():
     assert connection.agent_version_of("x\nAGENT_VERSION = 45\n") == 45
     assert connection.agent_version_of("nothing") == 0
+
+
+@pytest.mark.parametrize("client_version, uploaded", [(79, False), (80, True), (81, True)])
+def test_installed_lifecycle_patch_version_boundary(monkeypatch, tmp_path, client_version, uploaded):
+    """The local v80 repair survives an existing v79 client, not arbitrary future official agents."""
+    f, uploads = fake_frame("80", monkeypatch, tmp_path, local_version=client_version)
+    f.ensure_agent()
+    assert bool(uploads) is uploaded

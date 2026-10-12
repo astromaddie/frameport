@@ -356,3 +356,26 @@ def test_fast_ticks_scan_processes_every_2_s(fa):
         seen.append("procs" in m.sample(wall=2000.0 + clock["t"] - 100.0))
     assert seen == [False] * 7 + [True]
     assert 0.1 in fa.MON_INTERVALS and fa.MON_DEFAULT_INTERVAL == 0.5
+
+
+def test_monitor_groups_devkit_container_and_ends_correct_steam_title(fa, monkeypatch):
+    current = 3266924936
+    monkeypatch.setattr(fa, "devkit_gameid", lambda pkg: "Example")
+    monkeypatch.setattr(fa, "devkit_appid", lambda name: current)
+    w(fa.ROOT / "proc/300/cmdline", f"/usr/bin/conmon\0-n\0lepton-steamlaunch-{current}\0")
+    m, _ = monitor(fa)
+    sample = m.sample(wall=2000.0)
+    game = next(p for p in sample["procs"] if p["pid"] == 302)
+    assert game["game"] == GAME
+    running = {current}
+    calls = []
+    monkeypatch.setattr(fa, "container_running", lambda appid: appid in running)
+
+    def steam_js(expr):
+        calls.append(expr)
+        running.clear()
+
+    monkeypatch.setattr(fa, "steam_js", steam_js)
+    result = fa.monitor_end_game(GAME, wait=0.2)
+    assert result["ended"] and result["via"] == "steam"
+    assert calls == [f"SteamClient.Apps.TerminateApp('{fa.steam_gameid(current)}', false)"]

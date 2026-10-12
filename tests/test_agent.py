@@ -44,7 +44,7 @@ def test_launcher_template(monkeypatch, tmp_path):
     a.write_launcher(str(anchor), "/data/game dir/pkg", "com.x.y", "Game's Title", 123, "/lepton/lepton",
                      {"VK_INSTANCE_LAYERS": "", "bad-name": "x"})
     text = (anchor / "launch.sh").read_text()
-    assert "export SteamAppId=123" in text and "app_dir='/data/game dir/pkg'" in text
+    assert 'export SteamAppId="${SteamAppId:-123}"' in text and "app_dir='/data/game dir/pkg'" in text
     assert "export VK_INSTANCE_LAYERS=''" in text and "bad-name" not in text
     assert subprocess.run(["bash", "-n", str(anchor / "launch.sh")]).returncode == 0
 
@@ -1972,3 +1972,77 @@ def test_linux_x86_apps_run_through_fex(monkeypatch, tmp_path):
     data = os.path.join(prep["base"], "compatdata")
     assert f"export STEAM_COMPAT_DATA_PATH={data}" in text and f"mkdir -p {data}" in text  # FEX exits without it
     assert text.index("STEAM_COMPAT_DATA_PATH") < text.index("fex-compat-tool")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash launcher")
+@pytest.mark.parametrize("inherited, expected", [("3266924936", "3266924936"), (None, "123"), ("", "123")])
+def test_launcher_passes_steam_identity_to_lepton_and_cleanup(monkeypatch, tmp_path, inherited, expected):
+    """Execute the generated launcher: Steam's actual ID must reach both Lepton and the exit trap."""
+    a = load_agent(monkeypatch, tmp_path)
+    base = tmp_path / "game"
+    (base / "lepton-app").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    scripts = {
+        "flock": "exit 0\n",  # only identity/cleanup is under test; lock behavior has its own Linux test
+        "setsid": 'exec "$@"\n',
+        "podman": 'printf "%s\\n" "$*" > "$TEST_STOP"\n',
+        "lepton": 'printf "%s\\n" "$SteamAppId" > "$TEST_STARTED"\n',
+    }
+    for name, body in scripts.items():
+        path = bin_dir / name
+        path.write_text("#!/bin/bash\n" + body)
+        path.chmod(0o755)
+    a.write_launcher(str(base), str(base), "com.x.y", "X", 123, str(bin_dir / "lepton"), {})
+    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+           "FRAMEPORT_KEEP_DASHBOARD": "1", "TEST_STOP": str(tmp_path / "stopped"),
+           "TEST_STARTED": str(tmp_path / "started")}
+    env.pop("SteamAppId", None)
+    if inherited is not None:
+        env["SteamAppId"] = inherited
+    subprocess.run(["bash", str(base / "launch.sh")], env=env, timeout=10, check=True)
+    assert (tmp_path / "started").read_text().strip() == expected
+    assert (tmp_path / "stopped").read_text().strip() == f"kill lepton-steamlaunch-{expected}"
+
+
+def test_upgrade_identity_preserves_installed_helpers(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    anchor = Path(a.ANCHORS) / "com.x.y"
+    anchor.mkdir(parents=True)
+    a.write_launcher(str(anchor), str(anchor), "com.x.y", "X", 123, "/lepton", {})
+    path = anchor / "launch.sh"
+    text = path.read_text().replace('export SteamAppId="${SteamAppId:-123}"', 'export SteamAppId=123')
+    text = text.replace('wait "$child"', 'python3 newer-agent _logcat_keeper "$SteamAppId"\nwait "$child"')
+    path.write_text(text)
+    assert a.upgrade_launchers() == ["com.x.y"]
+    assert path.read_text() == text.replace('export SteamAppId=123', 'export SteamAppId="${SteamAppId:-123}"')
+    assert a.upgrade_launchers() == []
+
+
+def test_devkit_identity_detects_and_stops_both_container_generations(monkeypatch, tmp_path):
+    a = load_agent(monkeypatch, tmp_path)
+    dep = {"package": "com.x.y", "appid": 123, "base": str(tmp_path)}
+    monkeypatch.setattr(a, "deployment", lambda pkg: dep)
+    monkeypatch.setattr(a, "devkit_gameid", lambda pkg: "Example")
+    monkeypatch.setattr(a, "devkit_appid", lambda gameid: 456)
+    calls = []
+    running = {"lepton-steamlaunch-456", "lepton-steamlaunch-999"}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["podman", "ps"]:
+            return SimpleNamespace(stdout="\n".join(running), returncode=0)
+        if argv[:2] == ["podman", "kill"]:
+            running.discard(argv[2])
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(a, "run", run)
+    assert a.game_is_running(dep)
+    assert a.cmd_stop({"package": "com.x.y"}) == {"stopped": True}
+    assert running == {"lepton-steamlaunch-999"}
+    assert not a.game_is_running(dep)
+    running.add("lepton-steamlaunch-123")
+    assert a.game_is_running(dep)
+    a.cmd_stop({"package": "com.x.y"})
+    assert running == {"lepton-steamlaunch-999"}
+    assert ["podman", "kill", "lepton-steamlaunch-456"] in calls
