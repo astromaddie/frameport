@@ -1,0 +1,135 @@
+{
+  "date_jst": "2026-10-12",
+  "package": "com.SDI.TWD",
+  "chapter": 1,
+  "version_code": 40035500,
+  "deployment_appid": 2152352472,
+  "steam_devkit_appid": 3384173317,
+  "installed_agent_version": 80,
+  "lepton_version": "3.0.5",
+  "apk_changed": false,
+  "launcher_changed": false,
+  "settings_changed": false,
+  "tests": [
+    {
+      "name": "first-normal-steam-launch",
+      "start_epoch": 1791802935.799611,
+      "elapsed": 76.31175541877747,
+      "container_seen": true,
+      "natural_exit": false,
+      "identity": {
+        "apk_sha256": "fccf00af8586105ed0ffb38032448f5f51b2b36f090c3fde6a6612c04d8c3d37",
+        "apk_bytes": 85139454,
+        "libraries": {
+          "lib/arm64-v8a/libopenxr_loader.so": "9731c47a4641bea919f9955bbf76f89f698243dcf1a7655b06a67de31a72c531",
+          "lib/arm64-v8a/libopenxr_loader_original.so": "07f34aafa19f755bb84f3666a450a7cd964f579ff0b8d76a7bdea37feaf538da",
+          "lib/arm64-v8a/libopenxr_loader_huawei.so": "9035f04659fcbf649ff53aeec7a85c42169cb6a84c63552dcdd4f496b88193ad",
+          "lib/arm64-v8a/libopenxr_loader_meta.so": "adb7ce9e47746f71f4b2756658507d568ef40e5fa2d1bcf950608536a9a834e7",
+          "lib/arm64-v8a/libopenxr_loader_pico.so": "3c99b192c4f37c70240163377d960b57e8a05ea746464d7e0b6c94c4ec55ea0c",
+          "lib/arm64-v8a/libopenxr_loader_yvr.so": "9c9b0279aaddc370d799fa064a09ee056866760b52531bb7630226efae476c36",
+          "lib/arm64-v8a/libovrplatformloader.so": "6e988c19fc9f59d0f78c4b41e931cfe921dc83507225f296df2207231bcc43b1",
+          "lib/arm64-v8a/libovrplatformloader_meta.so": "b46d9d5a987c8fe300b345c4322b1710d9299d1bf9e1533b179ebafb294bb2a5",
+          "lib/arm64-v8a/libovrplatformloader_meta_q1.so": "90bcb3f143c0cdfc9d26922bf5f06579551c82bfe43c2bf0c423eb6465226300",
+          "lib/arm64-v8a/libOVRPlugin.so": "b8ec73164803a49895a9de456747420c89d026f6adec7af041ed5e894fb7cab9",
+          "lib/arm64-v8a/libpxrplatformloader.so": "67f092e8aad6d573e6362f35ccc98bd2eabf737526f35f325428c5741b8d033d",
+          "lib/arm64-v8a/libopenxr_loader_generic.so": "449e13bbe58de6718d4e530177924e09552a95d748a082739899144e2cb3ccf3",
+          "lib/arm64-v8a/libfp_vk.so": "e8c0965c188665a4e565e4a3af983ef1866d1cf9225665cc90d8df286bc96ef3"
+        }
+      },
+      "game_pids": [
+        "1222"
+      ],
+      "evidence_lines": [
+        "10-12 11:02:28.556  1222  1255 I FrameBridge: xrCreateInstance result=0",
+        "10-12 11:02:31.750  1222  1255 I FrameBridge: xrCreateInstance result=0",
+        "10-12 11:02:31.750  1222  1255 I FrameBridge: runtime recommended eye size 1728x1728 (max 8192x8192, scale 1.00)",
+        "10-12 11:02:31.773  1222  1255 I OVRPlugin: CompositorOpenXR::Initialize() - succeeded",
+        "10-12 11:02:31.922  1222  1323 I FrameBridge: xrCreateSwapchain 1728x1728 format=35907 samples=1 array=2 faces=1 usage=0x21 flags=0x0 result=0",
+        "10-12 11:02:52.056  1222  1323 I FrameBridge: pacing: 63.8 fps, displayTime vs predicted: avg 0.00 ms, max 0.00 ms",
+        "10-12 11:02:57.082  1222  1394 I FrameBridge: pacing: 23.1 fps, displayTime vs predicted: avg 0.00 ms, max 0.00 ms",
+        "10-12 11:03:02.112  1222  1394 I FrameBridge: pacing: 71.8 fps, displayTime vs predicted: avg 10.65 ms, max 13.89 ms",
+        "10-12 11:03:07.127  1222  1394 I FrameBridge: pacing: 65.0 fps, displayTime vs predicted: avg 14.10 ms, max 69.45 ms",
+        "10-12 11:03:12.142  1222  1394 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.90 ms",
+        "10-12 11:03:17.157  1222  1394 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.90 ms",
+        "10-12 11:03:22.170  1222  1394 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.90 ms",
+        "10-12 11:03:27.198  1222  1394 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.89 ms",
+        "10-12 11:02:58.272  1222  1394 I FrameBridge: projection view 0: space=0xfffe7f6077e0 swapchain=0xfffe7ff35780 rect=0,0 1728x1728 array=0 pos=-0.035,0.000,0.000 fov=-1.02/0.90",
+        "10-12 11:02:58.272  1222  1394 I FrameBridge: projection view 1: space=0xfffe7f6077e0 swapchain=0xfffe7ff35780 rect=0,0 1728x1728 array=1 pos=0.035,0.000,0.000 fov=-0.86/1.04"
+      ],
+      "fatal_or_end_frame_fault_lines": [],
+      "raw_log_sha256": "d257c4589fab82be1c66ef8b6bdf5edcd9629428d59f8e8ea3ee5700757b72e5"
+    },
+    {
+      "name": "second-normal-steam-launch",
+      "start_epoch": 1791803098.657849,
+      "elapsed": 75.71542716026306,
+      "container_seen": true,
+      "natural_exit": false,
+      "identity": {
+        "apk_sha256": "fccf00af8586105ed0ffb38032448f5f51b2b36f090c3fde6a6612c04d8c3d37",
+        "apk_bytes": 85139454,
+        "libraries": {
+          "lib/arm64-v8a/libopenxr_loader.so": "9731c47a4641bea919f9955bbf76f89f698243dcf1a7655b06a67de31a72c531",
+          "lib/arm64-v8a/libopenxr_loader_original.so": "07f34aafa19f755bb84f3666a450a7cd964f579ff0b8d76a7bdea37feaf538da",
+          "lib/arm64-v8a/libopenxr_loader_huawei.so": "9035f04659fcbf649ff53aeec7a85c42169cb6a84c63552dcdd4f496b88193ad",
+          "lib/arm64-v8a/libopenxr_loader_meta.so": "adb7ce9e47746f71f4b2756658507d568ef40e5fa2d1bcf950608536a9a834e7",
+          "lib/arm64-v8a/libopenxr_loader_pico.so": "3c99b192c4f37c70240163377d960b57e8a05ea746464d7e0b6c94c4ec55ea0c",
+          "lib/arm64-v8a/libopenxr_loader_yvr.so": "9c9b0279aaddc370d799fa064a09ee056866760b52531bb7630226efae476c36",
+          "lib/arm64-v8a/libovrplatformloader.so": "6e988c19fc9f59d0f78c4b41e931cfe921dc83507225f296df2207231bcc43b1",
+          "lib/arm64-v8a/libovrplatformloader_meta.so": "b46d9d5a987c8fe300b345c4322b1710d9299d1bf9e1533b179ebafb294bb2a5",
+          "lib/arm64-v8a/libovrplatformloader_meta_q1.so": "90bcb3f143c0cdfc9d26922bf5f06579551c82bfe43c2bf0c423eb6465226300",
+          "lib/arm64-v8a/libOVRPlugin.so": "b8ec73164803a49895a9de456747420c89d026f6adec7af041ed5e894fb7cab9",
+          "lib/arm64-v8a/libpxrplatformloader.so": "67f092e8aad6d573e6362f35ccc98bd2eabf737526f35f325428c5741b8d033d",
+          "lib/arm64-v8a/libopenxr_loader_generic.so": "449e13bbe58de6718d4e530177924e09552a95d748a082739899144e2cb3ccf3",
+          "lib/arm64-v8a/libfp_vk.so": "e8c0965c188665a4e565e4a3af983ef1866d1cf9225665cc90d8df286bc96ef3"
+        }
+      },
+      "game_pids": [
+        "1217"
+      ],
+      "evidence_lines": [
+        "10-12 11:05:11.687  1217  1252 I FrameBridge: xrCreateInstance result=0",
+        "10-12 11:05:14.860  1217  1252 I FrameBridge: xrCreateInstance result=0",
+        "10-12 11:05:14.861  1217  1252 I FrameBridge: runtime recommended eye size 1728x1728 (max 8192x8192, scale 1.00)",
+        "10-12 11:05:14.883  1217  1252 I OVRPlugin: CompositorOpenXR::Initialize() - succeeded",
+        "10-12 11:05:15.083  1217  1316 I FrameBridge: xrCreateSwapchain 1728x1728 format=35907 samples=1 array=2 faces=1 usage=0x21 flags=0x0 result=0",
+        "10-12 11:05:31.110  1217  1369 I FrameBridge: pacing: 62.1 fps, displayTime vs predicted: avg 0.00 ms, max 0.00 ms",
+        "10-12 11:05:36.124  1217  1369 I FrameBridge: pacing: 71.9 fps, displayTime vs predicted: avg 7.02 ms, max 27.78 ms",
+        "10-12 11:05:41.151  1217  1369 I FrameBridge: pacing: 71.0 fps, displayTime vs predicted: avg 13.93 ms, max 27.78 ms",
+        "10-12 11:05:46.168  1217  1369 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.89 ms",
+        "10-12 11:05:51.195  1217  1369 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.89 ms",
+        "10-12 11:05:56.224  1217  1369 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.90 ms",
+        "10-12 11:06:01.251  1217  1369 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.89 ms",
+        "10-12 11:06:06.278  1217  1369 I FrameBridge: pacing: 72.2 fps, displayTime vs predicted: avg 13.89 ms, max 13.90 ms",
+        "10-12 11:05:33.611  1217  1369 I FrameBridge: projection view 0: space=0xfffe898d1460 swapchain=0xfffe8a435280 rect=0,0 1728x1728 array=0 pos=-0.035,0.000,0.000 fov=-1.04/0.87",
+        "10-12 11:05:33.611  1217  1369 I FrameBridge: projection view 1: space=0xfffe898d1460 swapchain=0xfffe8a435280 rect=0,0 1728x1728 array=1 pos=0.035,0.000,0.000 fov=-0.89/1.02"
+      ],
+      "fatal_or_end_frame_fault_lines": [],
+      "raw_log_sha256": "7b6feeb128f934d30db042aab6acab629a8bda25ec53782e304ce38e428a0e16"
+    }
+  ],
+  "original_install": {
+    "ok": true,
+    "expansion_files": 2,
+    "expansion_bytes": 7853906133,
+    "headless_test": {
+      "state": "EXITED",
+      "elapsed_seconds": 42,
+      "milestone": "Lepton container started",
+      "findings": []
+    }
+  },
+  "unchanged_file_sha256": {
+    "launch.sh": "40df4efacb575cef455e3c3de9d8bcf2e34197ad0fc3a774ff42a3fade8747c4",
+    "settings.conf": "88a612b082c00e7167680178d314f151de00b04ff9a7b65a86fd97462ecc2595",
+    "deployment.json": "535d4e98ff5a79b3a481b71a2b5afc8ad55b0f230213fad4b0fc00f7c7c9a47c"
+  },
+  "initial_diagnostic_bytes": 37740439,
+  "restoration_and_cleanup": {
+    "persistent_data_restored": true,
+    "verified_original_files": 13,
+    "original_file_hashes_and_modes_match": true,
+    "diagnostic_allocated_bytes_removed": 37797888,
+    "cleanup_path": "/home/steamos/Applications/quest-frame/com.SDI.TWD/.startup-investigation-20261012"
+  }
+}
